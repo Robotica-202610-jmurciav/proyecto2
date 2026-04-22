@@ -302,7 +302,6 @@ class NavigationNode(Node):
         """BFS desde 'celda' hasta encontrar la celda libre más cercana."""
         if grid[celda[0]][celda[1]] != 1:
             return celda
-        # TODO: deque no creado o no importado
         q= deque([celda])
         visited = {celda}
         while q:
