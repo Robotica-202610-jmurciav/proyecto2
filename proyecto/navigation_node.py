@@ -212,7 +212,6 @@ class NavigationNode(Node):
                 d_min = min(cx, cy, W - cx, H - cy)
 
                 # ── Distancia a cada obstáculo rectangular ──
-                # TODO: Revisar cambios sombre la carga de los obstaculos
                 for obs in scene['obstaculos']:
                     x1, y1 = obs['p1']
                     x2, y2 = obs['p2']
@@ -268,7 +267,6 @@ class NavigationNode(Node):
         came_from = {}
 
         while open_set:
-            # TODO: heapq no creado o no importado
             _, cur = heapq.heappop(open_set)
 
             if cur == goal:
