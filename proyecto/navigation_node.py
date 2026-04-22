@@ -163,7 +163,6 @@ class NavigationNode(Node):
                         datos['dFrente']  = float(partes[1])
                     elif k == 'dDerecha':
                         datos['dDerecha'] = float(partes[1])
-                    # TODO: Cambiar el parseo de los obstaculos
                     elif '_Pto1' in k:
                         n = int(k.replace('Obstaculo', '').replace('_Pto1', ''))
                         while len(datos['obstaculos']) < n:
