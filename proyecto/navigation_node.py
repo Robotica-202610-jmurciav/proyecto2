@@ -3,6 +3,8 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+from collections import deque
+import heapq
 import math
 import threading
 import os
