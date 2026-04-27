@@ -63,7 +63,7 @@ class NavigationNode(Node):
         self.qf_theta_deg  = 0.0   # orientación final (°)
         self.path_configs  = []    # lista completa de configs para el archivo .txt
         self.pos_idx       = 1     # índice del siguiente waypoint a alcanzar
-        self.numero_escena = 2     # número de escena cargada (1-6)
+        self.numero_escena = 3     # número de escena cargada (1-6)
         self.segment_dist  = 0.0   # distancia del segmento actual (m)
         
         # Maquina de estados.
@@ -520,7 +520,7 @@ class NavigationNode(Node):
         self.numero_escena = numero
 
         # 1. Parsear escena
-        scene = self._parsear_escena(1)
+        scene = self._parsear_escena(3)
         if scene is None:
             return
         self.scene_data = scene
