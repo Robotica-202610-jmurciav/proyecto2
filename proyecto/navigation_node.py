@@ -566,6 +566,11 @@ class NavigationNode(Node):
 
         # 7. Iniciar ejecución
         self.pos_idx = 1
+        self._preparar_siguiente_segmento()
+        if self.target_theta_abs is None:
+            self.get_logger().error("target_theta_abs no se pudo calcular. Abortando.")
+            return
+        
         self.state = 'ROTANDO'
 
         self.get_logger().info(
@@ -573,6 +578,14 @@ class NavigationNode(Node):
             f"distancia total ≈ "
             f"{sum(math.sqrt((positions[i+1][0]-positions[i][0])**2+(positions[i+1][1]-positions[i][1])**2) for i in range(len(positions)-1)):.2f} m"
         )
+
+    def _preparar_siguiente_segmento(self):
+        """Calcula heading y distancia del segmento actual."""
+        if self.pos_idx < len(self.positions):
+            x1, y1 = self.positions[self.pos_idx - 1]
+            x2, y2 = self.positions[self.pos_idx]
+            self.target_theta_abs = math.atan2(y2 - y1, x2 - x1)
+            self.segment_dist     = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # BUCLE DE CONTROL PRINCIPAL  
