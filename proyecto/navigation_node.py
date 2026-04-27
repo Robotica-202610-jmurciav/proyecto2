@@ -20,10 +20,10 @@ from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
 # ──────────────────────────────────────────────────────────────────────────────
 ROBOT_RADIO   = 0.15   # m  – mitad del cuadrado de 0.30 m que encierra al robot
 CELL_SIZE     = 0.25   # m  – resolución de la cuadrícula
-VEL_LINEAL    = 0.3    # m/s
+VEL_LINEAL    = 0.5    # m/s
 VEL_ANGULAR   = 0.5    # rad/s
 TOL_ANGULAR   = 0.04   # rad ≈ 2.3°
-DIST_SEGURA   = 0.25   # m  – distancia mínima al obstáculo antes de abortar
+DIST_SEGURA   = 0.1   # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
 NUMERO_ESCENA = 3      # número de escena a ejecutar (1-6).
 
