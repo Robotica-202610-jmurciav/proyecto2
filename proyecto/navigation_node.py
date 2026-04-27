@@ -9,6 +9,7 @@ import math
 import threading
 import os
 
+from ament_index_python.packages import get_package_share_directory
 from .logic.lidar import obtener_distancia_angulo, obtener_distancias_rango
 from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
 
@@ -140,8 +141,8 @@ class NavigationNode(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _parsear_escena(self, numero: int) -> dict | None:
-        base = os.path.dirname(os.path.abspath(__file__))
-        ruta = os.path.join(base, '..', 'data', f'Escena-Problema{numero}.txt')
+        share_dir = get_package_share_directory('proyecto')
+        ruta = os.path.join(share_dir, 'data', f'Escena-Problema{numero}.txt')
 
         datos = {'obstaculos': []}
         try:
