@@ -25,6 +25,7 @@ VEL_ANGULAR   = 0.5    # rad/s
 TOL_ANGULAR   = 0.04   # rad ≈ 2.3°
 DIST_SEGURA   = 0.25   # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
+NUMERO_ESCENA = 3      # número de escena a ejecutar (1-6).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -520,7 +521,7 @@ class NavigationNode(Node):
         self.numero_escena = numero
 
         # 1. Parsear escena
-        scene = self._parsear_escena(3)
+        scene = self._parsear_escena(numero)
         if scene is None:
             return
         self.scene_data = scene
@@ -616,9 +617,8 @@ class NavigationNode(Node):
 
             elif estado == 'BLOQUEADO':
                 self.get_logger().warn(
-                    f"  ⚠ Segmento {self.pos_idx} BLOQUEADO – saltando al siguiente.")
-                self.pos_idx += 1
-                self._avanzar_estado_post_movimiento()
+                f"  ⚠ Segmento {self.pos_idx} BLOQUEADO – replanificando desde posición actual.")
+                self._replanificar()
 
         # ── ROTACION FINAL: girar a la orientación de qf ─────────────────────
         elif self.state == 'ROTACION_FINAL':
@@ -640,6 +640,59 @@ class NavigationNode(Node):
         else:
             self.state = 'ROTACION_FINAL'
 
+    def _replanificar(self):
+        """
+        Replantea el camino desde la posición actual (odometría) hasta qf.
+        Se invoca cuando un segmento queda bloqueado por un obstáculo.
+        """
+        scene = self.scene_data
+        if scene is None:
+            self.get_logger().error("Replanificación: no hay escena cargada.")
+            self.state = 'DONE'
+            return
+
+        qf = scene['qf']
+        pos_actual = (self.current_x, self.current_y)
+
+        self.get_logger().info(
+            f"  Replanificando desde ({pos_actual[0]:.2f}, {pos_actual[1]:.2f}) "
+            f"→ qf=({qf[0]:.2f}, {qf[1]:.2f})")
+
+        # Reconstruir grid y reejecutar A*
+        grid, rows, cols = self._construir_grid(scene)
+        grid_path = self._astar(grid, rows, cols, pos_actual, (qf[0], qf[1]))
+
+        if grid_path is None:
+            self.get_logger().error("Replanificación fallida. Abortando misión.")
+            self.state = 'DONE'
+            return
+
+        # Suavizar nuevo camino
+        smooth = self._suavizar_camino(grid_path, grid)
+        self.get_logger().info(f"  Nuevo camino suavizado: {len(smooth)} waypoints")
+
+        # Reconstruir positions desde posición actual
+        new_positions = [pos_actual]
+        for cell in smooth[1:-1]:
+            new_positions.append(self._celda_a_xy(cell[0], cell[1]))
+        new_positions.append((qf[0], qf[1]))
+
+        self.positions = new_positions
+        self.pos_idx   = 1
+
+        # Actualizar configuraciones para el archivo .txt
+        for i in range(len(new_positions) - 1):
+            x1, y1 = new_positions[i]
+            x2, y2 = new_positions[i + 1]
+            theta_seg = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            self.path_configs.append((x1, y1, theta_seg))
+            self.path_configs.append((x2, y2, theta_seg))
+        self.path_configs.append((qf[0], qf[1], qf[2]))
+        self._guardar_camino(self.path_configs, self.numero_escena)
+
+        # Continuar ejecución con el nuevo camino
+        self._preparar_siguiente_segmento()
+        self.state = 'ROTANDO'
     # ══════════════════════════════════════════════════════════════════════════
     # REPORTE FINAL Y RELOCALIZACIÓN
     # ══════════════════════════════════════════════════════════════════════════
