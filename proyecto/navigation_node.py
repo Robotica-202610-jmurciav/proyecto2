@@ -566,7 +566,7 @@ class NavigationNode(Node):
 
         # 7. Iniciar ejecución
         self.pos_idx = 1
-        self._preparar_siguiente_segmento()
+        #self._preparar_siguiente_segmento()
         if self.target_theta_abs is None:
             self.get_logger().error("target_theta_abs no se pudo calcular. Abortando.")
             return
