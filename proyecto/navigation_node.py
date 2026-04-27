@@ -520,7 +520,7 @@ class NavigationNode(Node):
         self.numero_escena = numero
 
         # 1. Parsear escena
-        scene = self._parsear_escena(numero)
+        scene = self._parsear_escena(2)
         if scene is None:
             return
         self.scene_data = scene
