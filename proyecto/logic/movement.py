@@ -32,7 +32,7 @@ def calcular_movimiento_relativo(tiempo_transcurrido, dist_x, dist_y, distancias
     # 2. Cinemática de tiempo: ¿Cuántos segundos tardamos a vel_lineal constante?
     tiempo_necesario = dist_total / vel_lineal
 
-    tiempo_transcurrido = tiempo_transcurrido / 2
+    #tiempo_transcurrido = tiempo_transcurrido / 2
     # 3. Condición de llegada por cronómetro
     if tiempo_transcurrido >= tiempo_necesario:
         return cmd, 'COMPLETADO'

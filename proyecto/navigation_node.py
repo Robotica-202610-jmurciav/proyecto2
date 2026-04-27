@@ -71,7 +71,7 @@ class NavigationNode(Node):
         
         # Temporizadores
         self.create_timer(0.1, self.control_loop)
-        self._inicio_timer = self.create_timer(2.0, self._auto_start)
+        self._inicio_timer = self.create_timer(1.0, self._auto_start)
         
         
         self.get_logger().info("Proyecto 2 - Nodo de Planificación Geométrica iniciado . . .")
