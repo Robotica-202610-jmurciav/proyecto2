@@ -544,6 +544,9 @@ class NavigationNode(Node):
         smooth = self._suavizar_camino(grid_path, grid)
         self.get_logger().info(f"Camino suavizado: {len(smooth)} waypoints")
 
+        self.get_logger().info("Waypoints planificados:")
+        for i, pos in enumerate(positions):
+            self.get_logger().info(f"  [{i}] x={pos[0]:.3f}, y={pos[1]:.3f}")
         # 5. Convertir a coordenadas mundo
         positions = [(q0[0], q0[1])]                            # inicio exacto
         for cell in smooth[1:-1]:
