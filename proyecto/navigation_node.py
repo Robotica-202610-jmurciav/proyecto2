@@ -55,7 +55,6 @@ class NavigationNode(Node):
         
         # Estado del movimiento
         self.target_theta_abs  = None  # ángulo absoluto objetivo (rad)
-        self.tiempo_maniobra   = 0.0   # cronómetro dead-reckoning (s)
         self.pose_inicial_flag = None  # bandera de inicio para mover_adelante
         
         # Datos adicionales
@@ -111,31 +110,38 @@ class NavigationNode(Node):
 
     def _mover_adelante(self, distancia: float) -> str:
         """
-        Avanza el robot hacia su frente la distancia indicada (dead-reckoning).
-        Devuelve: 'EN_RUTA' | 'COMPLETADO' | 'BLOQUEADO'
+        Avanza usando odometría real en vez de dead-reckoning por tiempo.
         """
+        # Guardar posición de inicio una sola vez
         if self.pose_inicial_flag is None:
-            self.pose_inicial_flag = True
-            self.tiempo_maniobra   = 0.0
+            self.pose_inicial_flag = (self.current_x, self.current_y)
 
-        cono = obtener_distancias_rango(self.last_scan, -CONO_VISION, CONO_VISION)
-
-        # dist_x = distancia, dist_y = 0  →  movimiento puro hacia el frente
-        cmd, estado = calcular_movimiento_relativo(
-            self.tiempo_maniobra,
-            distancia, 0.0,
-            cono,
-            dist_segura=DIST_SEGURA,
-            vel_lineal=VEL_LINEAL
+        # Distancia recorrida real según odometría
+        x0, y0 = self.pose_inicial_flag
+        recorrido = math.sqrt(
+            (self.current_x - x0) ** 2 + (self.current_y - y0) ** 2
         )
-        self.cmd_pub.publish(cmd)
-        self.tiempo_maniobra += 0.1
 
-        if estado in ('COMPLETADO', 'BLOQUEADO'):
+        # Verificar obstáculos al frente
+        cono = obtener_distancias_rango(self.last_scan, -CONO_VISION, CONO_VISION)
+        dist_frente = min((d for d in cono if d > 0), default=float('inf'))
+
+        if dist_frente < DIST_SEGURA:
             self.pose_inicial_flag = None
-            self.tiempo_maniobra   = 0.0
+            cmd = Twist()   # parar
+            self.cmd_pub.publish(cmd)
+            return 'BLOQUEADO'
 
-        return estado
+        if recorrido >= distancia:
+            self.pose_inicial_flag = None
+            self.cmd_pub.publish(Twist())   # parar
+            return 'COMPLETADO'
+
+        # Seguir avanzando
+        cmd = Twist()
+        cmd.linear.x = VEL_LINEAL
+        self.cmd_pub.publish(cmd)
+        return 'EN_RUTA'
 
     # ══════════════════════════════════════════════════════════════════════════
     # PARSEO DE ESCENA
@@ -483,10 +489,8 @@ class NavigationNode(Node):
     # SALIDA A ARCHIVO
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _guardar_camino(self, configs: list, escena: int,
-                        qf_est=None, q_act=None):
-        base = os.path.dirname(os.path.abspath(__file__))
-        ruta = os.path.join(base, '..', 'data', f'Camino-Escena{escena}.txt')
+    def _guardar_camino(self, configs, escena, qf_est=None, q_act=None):
+        ruta = os.path.expanduser(f'~/Camino-Escena{escena}.txt')
         try:
             with open(ruta, 'w', encoding='utf-8') as f:
                 f.write("# Camino geométrico solución – Proyecto 2\n")
@@ -494,15 +498,12 @@ class NavigationNode(Node):
                 for cfg in configs:
                     f.write(f"{cfg[0]:.4f},{cfg[1]:.4f},{cfg[2]:.2f}\n")
                 if qf_est:
-                    f.write(
-                        f"# qf_est,{qf_est[0]:.4f},{qf_est[1]:.4f},{qf_est[2]:.2f}\n")
+                    f.write(f"# qf_est,{qf_est[0]:.4f},{qf_est[1]:.4f},{qf_est[2]:.2f}\n")
                 if q_act:
-                    f.write(
-                        f"# q_act,{q_act[0]:.4f},{q_act[1]:.4f},{q_act[2]:.2f}\n")
+                    f.write(f"# q_act,{q_act[0]:.4f},{q_act[1]:.4f},{q_act[2]:.2f}\n")
             self.get_logger().info(f"Camino guardado → {ruta}")
         except Exception as e:
             self.get_logger().error(f"Error guardando camino: {e}")
-
     # ══════════════════════════════════════════════════════════════════════════
     # PUNTO DE ENTRADA DE LA MISIÓN
     # ══════════════════════════════════════════════════════════════════════════
@@ -565,7 +566,6 @@ class NavigationNode(Node):
 
         # 7. Iniciar ejecución
         self.pos_idx = 1
-        self._preparar_siguiente_segmento()
         self.state = 'ROTANDO'
 
         self.get_logger().info(
@@ -573,14 +573,6 @@ class NavigationNode(Node):
             f"distancia total ≈ "
             f"{sum(math.sqrt((positions[i+1][0]-positions[i][0])**2+(positions[i+1][1]-positions[i][1])**2) for i in range(len(positions)-1)):.2f} m"
         )
-
-    def _preparar_siguiente_segmento(self):
-        """Calcula heading y distancia del segmento actual."""
-        if self.pos_idx < len(self.positions):
-            x1, y1 = self.positions[self.pos_idx - 1]
-            x2, y2 = self.positions[self.pos_idx]
-            self.target_theta_abs = math.atan2(y2 - y1, x2 - x1)
-            self.segment_dist     = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # BUCLE DE CONTROL PRINCIPAL  
