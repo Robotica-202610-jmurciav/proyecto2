@@ -83,17 +83,29 @@ class NavigationNode(Node):
     def odom_callback(self, msg):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        theta = 2.0 * math.atan2(qz, qw)
 
-        # Filtrar lecturas espurias en el origen
-        if abs(x) < 0.01 and abs(y) < 0.01 and \
-        (abs(self.current_x) > 0.1 or abs(self.current_y) > 0.1):
-            return
+        # Ignorar si la posición es exactamente (0,0) o muy cercana al origen
+        # Y la posición actual ya está establecida lejos del origen
+        dist_desde_origen = math.sqrt(x**2 + y**2)
+        dist_desde_actual = math.sqrt(
+            (x - self.current_x)**2 + (y - self.current_y)**2
+        )
+
+        # Filtrar saltos bruscos mayores a 0.5 m entre lecturas consecutivas
+        if self.current_x != 0.0 or self.current_y != 0.0:
+            if dist_desde_actual > 0.5:
+                self.get_logger().warn(
+                    f"Odom descartada: salto de {dist_desde_actual:.2f} m "
+                    f"({self.current_x:.2f},{self.current_y:.2f}) → ({x:.2f},{y:.2f})",
+                    throttle_duration_sec=1.0)
+                return
 
         self.current_x = x
         self.current_y = y
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        self.current_theta = 2.0 * math.atan2(qz, qw)
+        self.current_theta = theta
 
     def lidar_callback(self, msg):
         self.last_scan = msg
@@ -123,7 +135,13 @@ class NavigationNode(Node):
         """
         # Guardar posición de inicio una sola vez
         if self.pose_inicial_flag is None:
+            dist_origen = math.sqrt(self.current_x**2 + self.current_y**2)
+            if dist_origen < 0.1:
+                # Odometría aún no válida, esperar
+                return 'EN_RUTA'
             self.pose_inicial_flag = (self.current_x, self.current_y)
+            self.get_logger().info(
+                f"  Inicio segmento en ({self.current_x:.2f}, {self.current_y:.2f})")
 
         # Distancia recorrida real según odometría
         x0, y0 = self.pose_inicial_flag
