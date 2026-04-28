@@ -21,11 +21,11 @@ from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
 ROBOT_RADIO   = 0.08   # m  – mitad del cuadrado de 0.30 m que encierra al robot
 CELL_SIZE     = 0.25   # m  – resolución de la cuadrícula
 VEL_LINEAL    = 0.5    # m/s
-VEL_ANGULAR   = 0.5    # rad/s
+VEL_ANGULAR   = 0.3    # rad/s
 TOL_ANGULAR   = 0.04   # rad ≈ 2.3°
-DIST_SEGURA   = 0.1   # m  – distancia mínima al obstáculo antes de abortar
+DIST_SEGURA   = 0.1    # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
-NUMERO_ESCENA = 3      # número de escena a ejecutar (1-6).
+NUMERO_ESCENA = 5      # número de escena a ejecutar (1-6).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -64,7 +64,7 @@ class NavigationNode(Node):
         self.qf_theta_deg  = 0.0   # orientación final (°)
         self.path_configs  = []    # lista completa de configs para el archivo .txt
         self.pos_idx       = 1     # índice del siguiente waypoint a alcanzar
-        self.numero_escena = 3     # número de escena cargada (1-6)
+        self.numero_escena = 5     # número de escena cargada (1-6)
         self.segment_dist  = 0.0   # distancia del segmento actual (m)
         
         # Maquina de estados.
@@ -112,6 +112,7 @@ class NavigationNode(Node):
     def _mover_adelante(self, distancia: float) -> str:
         """
         Avanza usando odometría real en vez de dead-reckoning por tiempo.
+        Devuelve: 'EN_RUTA' | 'COMPLETADO' | 'BLOQUEADO'
         """
         # Guardar posición de inicio una sola vez
         if self.pose_inicial_flag is None:
@@ -123,19 +124,21 @@ class NavigationNode(Node):
             (self.current_x - x0) ** 2 + (self.current_y - y0) ** 2
         )
 
-        # Verificar obstáculos al frente
+        # Verificar obstáculos al frente con LiDAR
         cono = obtener_distancias_rango(self.last_scan, -CONO_VISION, CONO_VISION)
-        dist_frente = min((d for d in cono if d > 0), default=float('inf'))
+        distancias_validas = [d for d in cono if 0 < d < float('inf')]
+        dist_frente = min(distancias_validas) if distancias_validas else float('inf')
 
         if dist_frente < DIST_SEGURA:
+            self.get_logger().warn(
+                f"  Obstáculo a {dist_frente:.2f} m – BLOQUEADO")
             self.pose_inicial_flag = None
-            cmd = Twist()   # parar
-            self.cmd_pub.publish(cmd)
+            self.cmd_pub.publish(Twist())
             return 'BLOQUEADO'
 
         if recorrido >= distancia:
             self.pose_inicial_flag = None
-            self.cmd_pub.publish(Twist())   # parar
+            self.cmd_pub.publish(Twist())
             return 'COMPLETADO'
 
         # Seguir avanzando
@@ -143,7 +146,6 @@ class NavigationNode(Node):
         cmd.linear.x = VEL_LINEAL
         self.cmd_pub.publish(cmd)
         return 'EN_RUTA'
-
     # ══════════════════════════════════════════════════════════════════════════
     # PARSEO DE ESCENA
     # ══════════════════════════════════════════════════════════════════════════
@@ -521,7 +523,7 @@ class NavigationNode(Node):
         self.numero_escena = numero
 
         # 1. Parsear escena
-        scene = self._parsear_escena(5)
+        scene = self._parsear_escena(numero)
         if scene is None:
             return
         self.scene_data = scene
@@ -770,13 +772,26 @@ class NavigationNode(Node):
         self.cmd_pub.publish(Twist())
 
 
+    def odom_callback(self, msg):
+        """Actualiza la posición y orientación actual del robot a partir de la odometría.
+        """
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        
+        # Ignorar lecturas en el origen exacto después del inicio
+        # (artefacto del bridge de Gazebo al arrancar)
+        if x == 0.0 and y == 0.0 and self.current_x != 0.0:
+            return
+        
+        self.current_x = x
+        self.current_y = y
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        self.current_theta = 2.0 * math.atan2(qz, qw)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ▼▼▼  CAMBIAR ESTE NÚMERO PARA SELECCIONAR LA ESCENA  ▼▼▼
-NUMERO_ESCENA = 1
-# ▲▲▲──────────────────────────────────────────────────▲▲▲
 
 
 def main(args=None):

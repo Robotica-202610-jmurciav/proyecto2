@@ -2,21 +2,15 @@ import math
 from geometry_msgs.msg import Twist
 
 def calcular_rotacion(theta_actual, theta_objetivo, vel_angular_max=0.5, tolerancia=0.05):
-    """
-    Calcula el mensaje Twist necesario para rotar hacia un ángulo objetivo.
-    Retorna una tupla: (mensaje_Twist, booleano_completado)
-    """
     cmd = Twist()
     error = theta_objetivo - theta_actual
-    
-    # Normalizar el error entre -PI y PI para que el robot siempre gire por el lado más corto
     error = math.atan2(math.sin(error), math.cos(error))
 
     if abs(error) <= tolerancia:
-        return cmd, True  # Rotación completada (comandos en 0.0)
+        return cmd, True
 
-    # Lógica proporcional básica para el giro
-    cmd.angular.z = max(min(error, vel_angular_max), -vel_angular_max)
+    # Invertir signo para compensar convención de Gazebo
+    cmd.angular.z = -(max(min(error, vel_angular_max), -vel_angular_max))
     return cmd, False
 
 def calcular_movimiento_relativo(tiempo_transcurrido, dist_x, dist_y, distancias_direccion, dist_segura=0.3, vel_lineal=0.4):
