@@ -9,8 +9,12 @@ def calcular_rotacion(theta_actual, theta_objetivo, vel_angular_max=0.5, toleran
     if abs(error) <= tolerancia:
         return cmd, True
 
-    # Invertir signo para compensar convención de Gazebo
-    cmd.angular.z = -(max(min(error, vel_angular_max), -vel_angular_max))
+    # Proporcional con frenado: más lento cuando está cerca del objetivo
+    factor = min(abs(error) / 0.5, 1.0)   # frena cuando error < 0.5 rad (~28°)
+    vel = vel_angular_max * factor
+    vel = max(vel, 0.1)                    # mínimo 0.1 para no quedarse trabado
+
+    cmd.angular.z = -(vel if error > 0 else -vel)  # negativo por convención Gazebo
     return cmd, False
 
 def calcular_movimiento_relativo(tiempo_transcurrido, dist_x, dist_y, distancias_direccion, dist_segura=0.3, vel_lineal=0.4):
