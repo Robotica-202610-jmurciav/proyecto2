@@ -25,7 +25,7 @@ VEL_ANGULAR   = 0.2    # rad/s
 TOL_ANGULAR   = 0.15   # rad ≈ 2.3°
 DIST_SEGURA   = 0.1    # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
-NUMERO_ESCENA = 5      # número de escena a ejecutar (1-6).
+NUMERO_ESCENA = 6      # número de escena a ejecutar (1-6).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -64,7 +64,7 @@ class NavigationNode(Node):
         self.qf_theta_deg  = 0.0   # orientación final (°)
         self.path_configs  = []    # lista completa de configs para el archivo .txt
         self.pos_idx       = 1     # índice del siguiente waypoint a alcanzar
-        self.numero_escena = 5     # número de escena cargada (1-6)
+        self.numero_escena = 6     # número de escena cargada (1-6)
         self.segment_dist  = 0.0   # distancia del segmento actual (m)
         
         # Maquina de estados.
