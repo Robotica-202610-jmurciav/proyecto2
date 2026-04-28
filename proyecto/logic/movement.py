@@ -13,7 +13,7 @@ def calcular_rotacion(theta_actual, theta_objetivo, vel_angular_max=0.5, toleran
     factor = min(abs(error) / 0.5, 1.0)
     vel = vel_angular_max * factor
 
-    cmd.angular.z = -(vel if error > 0 else -vel)
+    cmd.angular.z = (vel if error > 0 else -vel)
     return cmd, False
 
 def calcular_movimiento_relativo(tiempo_transcurrido, dist_x, dist_y, distancias_direccion, dist_segura=0.3, vel_lineal=0.4):
