@@ -553,6 +553,7 @@ class NavigationNode(Node):
         self.positions   = positions
         self.qf_theta_deg = qf[2]
 
+
         self.get_logger().info("Waypoints planificados:")
         for i, pos in enumerate(positions):
             self.get_logger().info(f"  [{i}] x={pos[0]:.3f}, y={pos[1]:.3f}")
@@ -597,8 +598,23 @@ class NavigationNode(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def control_loop(self):
-        if self.last_scan is None or self.state in ('IDLE', 'DONE'):
+        if self.last_scan is None:
+            self.get_logger().warn("Esperando LiDAR...", throttle_duration_sec=2.0)
             return
+        if self.state in ('IDLE', 'DONE', 'ESPERANDO_COMANDO'):
+            return
+        if self.target_theta_abs is None:
+            self.get_logger().warn("target_theta_abs es None", throttle_duration_sec=2.0)
+            return
+
+        # Log del estado actual cada 2 segundos
+        self.get_logger().info(
+            f"Estado: {self.state} | "
+            f"pos=({self.current_x:.2f},{self.current_y:.2f}) | "
+            f"theta={math.degrees(self.current_theta):.1f}° | "
+            f"target={math.degrees(self.target_theta_abs):.1f}°",
+            throttle_duration_sec=2.0
+        )
 
         # ── ROTANDO: alinear hacia el siguiente waypoint ──────────────────────
         if self.state == 'ROTANDO':
