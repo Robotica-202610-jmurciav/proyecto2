@@ -46,7 +46,7 @@ colcon build --packages-select proyecto && source install/setup.bash
 
 ```bash
 # Terminal 1 — Gazebo con la escena
-gz sim escena<n>.sdf
+gz sim escena<X>.sdf
 
 # Terminal 2 — Bridge ROS2 ↔ Gazebo
 ros2 run ros_gz_bridge parameter_bridge--ros-args-p config_file:=config_bridge.yaml
