@@ -21,8 +21,8 @@ from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
 ROBOT_RADIO   = 0.08   # m  – mitad del cuadrado de 0.30 m que encierra al robot
 CELL_SIZE     = 0.25   # m  – resolución de la cuadrícula
 VEL_LINEAL    = 0.5    # m/s
-VEL_ANGULAR   = 0.3    # rad/s
-TOL_ANGULAR   = 0.08   # rad ≈ 2.3°
+VEL_ANGULAR   = 0.2    # rad/s
+TOL_ANGULAR   = 0.15   # rad ≈ 2.3°
 DIST_SEGURA   = 0.1    # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
 NUMERO_ESCENA = 5      # número de escena a ejecutar (1-6).
@@ -81,9 +81,16 @@ class NavigationNode(Node):
     # CALLBACKS DE ROS2
     # =======================================================
     def odom_callback(self, msg):
-        self.current_x = msg.pose.pose.position.x
-        self.current_y = msg.pose.pose.position.y
-        
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+
+        # Filtrar lecturas espurias en el origen
+        if abs(x) < 0.01 and abs(y) < 0.01 and \
+        (abs(self.current_x) > 0.1 or abs(self.current_y) > 0.1):
+            return
+
+        self.current_x = x
+        self.current_y = y
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         self.current_theta = 2.0 * math.atan2(qz, qw)
@@ -771,23 +778,6 @@ class NavigationNode(Node):
         # Frenar motores
         self.cmd_pub.publish(Twist())
 
-
-    def odom_callback(self, msg):
-        """Actualiza la posición y orientación actual del robot a partir de la odometría.
-        """
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        
-        # Ignorar lecturas en el origen exacto después del inicio
-        # (artefacto del bridge de Gazebo al arrancar)
-        if x == 0.0 and y == 0.0 and self.current_x != 0.0:
-            return
-        
-        self.current_x = x
-        self.current_y = y
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        self.current_theta = 2.0 * math.atan2(qz, qw)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
