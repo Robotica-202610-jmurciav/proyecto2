@@ -216,59 +216,6 @@ class NavigationNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error parseando escena: {e}")
         return None
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # CONSTRUCCIÓN DEL C-SPACE EN CUADRÍCULA
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _construir_grid(self, scene: dict):
-        """
-        Clasifica cada celda como:
-          0  libre      - el robot puede transitar libremente
-          1  ocupada    - dentro de ROBOT_RADIO del obstáculo / pared (C-obstáculo)
-          2  semi-libre - entre ROBOT_RADIO y 2·ROBOT_RADIO (zona de riesgo)
-
-        Devuelve (grid, filas, columnas).
-        """
-        W, H  = scene['ancho'], scene['alto']
-        cols  = int(math.ceil(W / CELL_SIZE))
-        rows  = int(math.ceil(H / CELL_SIZE))
-        grid  = [[0] * cols for _ in range(rows)]
-
-        for r in range(rows):
-            for c in range(cols):
-                cx = (c + 0.5) * CELL_SIZE
-                cy = (r + 0.5) * CELL_SIZE
-
-                # ── Distancia a las paredes del escenario ──
-                d_min = min(cx, cy, W - cx, H - cy)
-
-                # ── Distancia a cada obstáculo rectangular ──
-                for obs in scene['obstaculos']:
-                    x1, y1 = obs['p1']
-                    x2, y2 = obs['p2']
-                    xmin, xmax = min(x1, x2), max(x1, x2)
-                    ymin, ymax = min(y1, y2), max(y1, y2)
-                    dx = max(xmin - cx, 0.0, cx - xmax)
-                    dy = max(ymin - cy, 0.0, cy - ymax)
-                    d_min = min(d_min, math.sqrt(dx * dx + dy * dy))
-
-                # ── Clasificación ──
-                if   d_min < ROBOT_RADIO:
-                    grid[r][c] = 1              # ocupada
-                elif d_min < 2 * ROBOT_RADIO:
-                    grid[r][c] = 2              # semi-libre
-
-        return grid, rows, cols
-
-    # ── Conversión mundo ↔ celda ──────────────────────────────────────────────
-
-    def _xy_a_celda(self, x: float, y: float):
-        return int(y / CELL_SIZE), int(x / CELL_SIZE)
-
-    def _celda_a_xy(self, r: int, c: int):
-        return (c + 0.5) * CELL_SIZE, (r + 0.5) * CELL_SIZE
-
     # ══════════════════════════════════════════════════════════════════════════
     # PLANIFICADOR A*
     # ══════════════════════════════════════════════════════════════════════════
