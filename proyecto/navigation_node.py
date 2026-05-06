@@ -13,13 +13,14 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from .logic.lidar import obtener_distancia_angulo, obtener_distancias_rango
 from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
+from .logic.planner_rtt import rrt, suavizar
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constantes del robot y de planificación
 # ──────────────────────────────────────────────────────────────────────────────
 ROBOT_RADIO   = 0.08   # m  – mitad del cuadrado de 0.30 m que encierra al robot
-CELL_SIZE     = 0.25   # m  – resolución de la cuadrícula
+# CELL_SIZE     = 0.5    # m  – resolución de la cuadrícula, qué no se usa
 VEL_LINEAL    = 0.5    # m/s
 VEL_ANGULAR   = 0.2    # rad/s
 TOL_ANGULAR   = 0.15   # rad ≈ 2.3°
@@ -60,12 +61,12 @@ class NavigationNode(Node):
         
         # Datos adicionales
         self.scene_data    = None
-        self.positions     = []    # [(x,y), …] waypoints en coordenadas mundo
-        self.qf_theta_deg  = 0.0   # orientación final (°)
-        self.path_configs  = []    # lista completa de configs para el archivo .txt
-        self.pos_idx       = 1     # índice del siguiente waypoint a alcanzar
-        self.numero_escena = 6     # número de escena cargada (1-6)
-        self.segment_dist  = 0.0   # distancia del segmento actual (m)
+        self.positions     = []                # [(x,y), …] waypoints en coordenadas mundo
+        self.qf_theta_deg  = 0.0               # orientación final (°)
+        self.path_configs  = []                # lista completa de configs para el archivo .txt
+        self.pos_idx       = 1                 # índice del siguiente waypoint a alcanzar
+        self.numero_escena = NUMERO_ESCENA     # número de escena cargada (1-6)
+        self.segment_dist  = 0.0               # distancia del segmento actual (m)
         
         # Maquina de estados.
         self.state = 'ESPERANDO_COMANDO'  # 'ESPERANDO_COMANDO', 'EJECUTANDO_COMANDO'
@@ -75,7 +76,7 @@ class NavigationNode(Node):
         self._inicio_timer = self.create_timer(1.0, self._auto_start)
         
         
-        self.get_logger().info("Proyecto 2 - Nodo de Planificación Geométrica iniciado . . .")
+        self.get_logger().info("Proyecto 3 - Nodo RTT iniciado . . .")
         
     # =======================================================
     # CALLBACKS DE ROS2
@@ -87,14 +88,10 @@ class NavigationNode(Node):
         qw = msg.pose.pose.orientation.w
         theta = 2.0 * math.atan2(qz, qw)
 
-        # Ignorar si la posición es exactamente (0,0) o muy cercana al origen
-        # Y la posición actual ya está establecida lejos del origen
-        dist_desde_origen = math.sqrt(x**2 + y**2)
         dist_desde_actual = math.sqrt(
             (x - self.current_x)**2 + (y - self.current_y)**2
         )
 
-        # Filtrar saltos bruscos mayores a 0.5 m entre lecturas consecutivas
         if self.current_x != 0.0 or self.current_y != 0.0:
             if dist_desde_actual > 0.5:
                 self.get_logger().warn(
@@ -536,11 +533,6 @@ class NavigationNode(Node):
     # PUNTO DE ENTRADA DE LA MISIÓN
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _auto_start(self):
-        """Inicia la misión automáticamente tras 2 s (sensores listos)."""
-        self._inicio_timer.cancel()
-        self.ejecutar_escena(self.numero_escena)
-
     def ejecutar_escena(self, numero: int):
         """
         Punto de entrada público.  Parsea, planifica y arranca la ejecución.
@@ -554,28 +546,30 @@ class NavigationNode(Node):
         self.scene_data = scene
         q0, qf = scene['q0'], scene['qf']
 
-        # 2. Construir cuadrícula C-space
-        grid, rows, cols = self._construir_grid(scene)
-        self.get_logger().info(
-            f"C-space: cuadrícula {rows}×{cols} celdas "
-            f"(resolución {CELL_SIZE} m, margen robot {ROBOT_RADIO} m)")
-
-        # 3. Planificar con A*
-        grid_path = self._astar(grid, rows, cols, (q0[0], q0[1]), (qf[0], qf[1]))
-        if grid_path is None:
-            self.get_logger().error("Planificación fallida. Abortando misión.")
+        # 2. Planificación RTT
+        self.get_logger().info("Planificando con RTT . . .")
+        waypoints_raw, dt = rrt(
+            q0_xy = (q0[0], q0[1]),
+            qf_xy = (qf[0], qf[1]),
+            scene  = scene,
+            robot_radio = ROBOT_RADIO,
+        )
+        
+        # 3. Verificar resultado
+        if waypoints_raw is None:
+            self.get_logger().error(f"RRT no encontró solución en {dt:.1f}s. Abortando.")
             return
-        self.get_logger().info(f"A*: {len(grid_path)} celdas en el camino bruto")
-
-        # 4. Suavizar
-        smooth = self._suavizar_camino(grid_path, grid)
-        self.get_logger().info(f"Camino suavizado: {len(smooth)} waypoints")
-
+        
+        self.get_logger().info(f"RRT encontró camino con {len(waypoints_raw)} waypoints en {dt:.3f} s.")
+        
+        # 4. Suavizado de camino
+        waypoints_suaves = suavizar(waypoints_raw, scene, ROBOT_RADIO)
+        self.get_logger().info(f"Suavizado: {len(waypoints_raw)} → {len(waypoints_suaves)} waypoints")
         
         # 5. Convertir a coordenadas mundo
         positions = [(q0[0], q0[1])]                            # inicio exacto
-        for cell in smooth[1:-1]:
-            positions.append(self._celda_a_xy(cell[0], cell[1]))
+        for wp in waypoints_suaves[1:-1]:
+            positions.append(wp)
         positions.append((qf[0], qf[1]))                        # fin exacto
         self.positions   = positions
         self.qf_theta_deg = qf[2]
@@ -664,7 +658,7 @@ class NavigationNode(Node):
 
             elif estado == 'BLOQUEADO':
                 self.get_logger().warn(
-                f"  ⚠ Segmento {self.pos_idx} BLOQUEADO – replanificando desde posición actual.")
+                f"  ⚠ Segmento {self.pos_idx} BLOQUEADO - replanificando desde posición actual.")
                 self._replanificar()
 
         # ── ROTACION FINAL: girar a la orientación de qf ─────────────────────
@@ -705,41 +699,33 @@ class NavigationNode(Node):
             f"  Replanificando desde ({pos_actual[0]:.2f}, {pos_actual[1]:.2f}) "
             f"→ qf=({qf[0]:.2f}, {qf[1]:.2f})")
 
-        # Reconstruir grid y reejecutar A*
-        grid, rows, cols = self._construir_grid(scene)
-        grid_path = self._astar(grid, rows, cols, pos_actual, (qf[0], qf[1]))
-
-        if grid_path is None:
-            self.get_logger().error("Replanificación fallida. Abortando misión.")
+        # Replanificar con RRT desde la posición actual (odometría) hasta qf
+        waypoints_raw, dt = rrt(pos_actual, (qf[0], qf[1]),
+                                scene, ROBOT_RADIO)
+        if waypoints_raw is None:
+            self.get_logger().error("Replanificación RRT fallida. Abortando.")
             self.state = 'DONE'
             return
 
-        # Suavizar nuevo camino
-        smooth = self._suavizar_camino(grid_path, grid)
-        self.get_logger().info(f"  Nuevo camino suavizado: {len(smooth)} waypoints")
+        # Suavizar el nuevo camino
+        waypoints_suave = suavizar(waypoints_raw, scene, ROBOT_RADIO)
 
-        # Reconstruir positions desde posición actual
-        new_positions = [pos_actual]
-        for cell in smooth[1:-1]:
-            new_positions.append(self._celda_a_xy(cell[0], cell[1]))
-        new_positions.append((qf[0], qf[1]))
-
-        self.positions = new_positions
+        new_pos = [pos_actual] + list(waypoints_suave[1:-1]) + [(qf[0], qf[1])]
+        self.positions = new_pos
         self.pos_idx   = 1
 
-        # Actualizar configuraciones para el archivo .txt
-        for i in range(len(new_positions) - 1):
-            x1, y1 = new_positions[i]
-            x2, y2 = new_positions[i + 1]
-            theta_seg = math.degrees(math.atan2(y2 - y1, x2 - x1))
-            self.path_configs.append((x1, y1, theta_seg))
-            self.path_configs.append((x2, y2, theta_seg))
+        for i in range(len(new_pos)-1):
+            x1,y1 = new_pos[i]; x2,y2 = new_pos[i+1]
+            th = math.degrees(math.atan2(y2-y1, x2-x1))
+            self.path_configs.append((x1, y1, th))
+            self.path_configs.append((x2, y2, th))
         self.path_configs.append((qf[0], qf[1], qf[2]))
         self._guardar_camino(self.path_configs, self.numero_escena)
 
-        # Continuar ejecución con el nuevo camino
         self._preparar_siguiente_segmento()
         self.state = 'ROTANDO'
+        
+        
     # ══════════════════════════════════════════════════════════════════════════
     # REPORTE FINAL Y RELOCALIZACIÓN
     # ══════════════════════════════════════════════════════════════════════════
@@ -753,49 +739,37 @@ class NavigationNode(Node):
 
         q_act  = self._relocalizar(scene, qf_teo)
 
-        # ── Errores ──────────────────────────────────────────────────────────
-        d_teo_est = math.sqrt(
-            (qf_teo[0] - qf_est[0]) ** 2 + (qf_teo[1] - qf_est[1]) ** 2)
-        a_teo_est = abs(qf_teo[2] - qf_est[2])
-        a_teo_est = min(a_teo_est, 360 - a_teo_est)
+        d = lambda a,b: math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2)
+        a = lambda a,b: min(abs(a[2]-b[2]), 360-abs(a[2]-b[2]))
 
         sep = "═" * 60
         self.get_logger().info(sep)
-        self.get_logger().info("  RESULTADOS  Escena %d" % self.numero_escena)
+        self.get_logger().info(f"  RESULTADOS RRT – Escena {self.numero_escena}")
         self.get_logger().info(sep)
         self.get_logger().info(
-            f"  qf teórico  (qf)     : "
-            f"x={qf_teo[0]:.4f} m, y={qf_teo[1]:.4f} m, θ={qf_teo[2]:.2f}°")
+            f"  qf teórico  : x={qf_teo[0]:.4f} y={qf_teo[1]:.4f} θ={qf_teo[2]:.2f}°")
         self.get_logger().info(
-            f"  qf estimado (qf_est) : "
-            f"x={qf_est[0]:.4f} m, y={qf_est[1]:.4f} m, θ={qf_est[2]:.2f}°")
+            f"  qf estimado : x={qf_est[0]:.4f} y={qf_est[1]:.4f} θ={qf_est[2]:.2f}°")
         self.get_logger().info(
-            f"  Error (qf → qf_est)  : "
-            f"{d_teo_est:.4f} m  |  {a_teo_est:.2f}°")
-
+            f"  Error teo→est: {d(qf_teo,qf_est):.4f}m / {a(qf_teo,qf_est):.2f}°")
         if q_act:
-            d_est_act = math.sqrt(
-                (qf_est[0] - q_act[0]) ** 2 + (qf_est[1] - q_act[1]) ** 2)
-            a_est_act = abs(qf_est[2] - q_act[2])
-            a_est_act = min(a_est_act, 360 - a_est_act)
             self.get_logger().info(
-                f"  q_act real  (q_act)  : "
-                f"x={q_act[0]:.4f} m, y={q_act[1]:.4f} m, θ={q_act[2]:.2f}°")
+                f"  q_act real  : x={q_act[0]:.4f} y={q_act[1]:.4f} θ={q_act[2]:.2f}°")
             self.get_logger().info(
-                f"  Error (qf_est→q_act) : "
-                f"{d_est_act:.4f} m  |  {a_est_act:.2f}°")
-        else:
-            self.get_logger().warn(
-                "  Relocalización no disponible – LiDAR sin lecturas válidas.")
-
+                f"  Error est→act: {d(qf_est,q_act):.4f}m / {a(qf_est,q_act):.2f}°")
         self.get_logger().info(sep)
-
-        # Completar el archivo con configuraciones finales
+        
+        # Guardar resultados en el mismo archivo del camino para análisis posterior
         self._guardar_camino(self.path_configs, self.numero_escena, qf_est, q_act)
-
-        # Frenar motores
+        # Frenar el robot al finalizar
         self.cmd_pub.publish(Twist())
 
+    def _auto_start(self):
+        """
+        Función de callback del timer de inicio automático. Se ejecuta una sola vez al iniciar el nodo, y lanza la ejecución de la escena.
+        """
+        self._inicio_timer.cancel()
+        self.ejecutar_escena(self.numero_escena)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
