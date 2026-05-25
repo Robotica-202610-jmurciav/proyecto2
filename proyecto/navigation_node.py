@@ -3,28 +3,24 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from collections import deque
-import heapq
 import math
-import threading
 import os
-
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from .logic.lidar import obtener_distancia_angulo, obtener_distancias_rango
 from .logic.movement import calcular_rotacion, calcular_movimiento_relativo
-from .logic.planner_rtt import rrt, suavizar
+from .logic.planner_rtt import rrt, suavizar, calcular_longitud_camino, calcular_suma_angular
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constantes del robot y de planificación
 # ──────────────────────────────────────────────────────────────────────────────
-ROBOT_RADIO   = 0.08   # m  – mitad del cuadrado de 0.30 m que encierra al robot
-# CELL_SIZE     = 0.5    # m  – resolución de la cuadrícula, qué no se usa
+ROBOT_RADIO   = 0.15   # m  – radio del robot (≈ mitad del lado 0.30 m)
 VEL_LINEAL    = 0.5    # m/s
 VEL_ANGULAR   = 0.2    # rad/s
-TOL_ANGULAR   = 0.15   # rad ≈ 2.3°
-DIST_SEGURA   = 0.1    # m  – distancia mínima al obstáculo antes de abortar
+TOL_ANGULAR   = 0.15   # rad ≈ 8.6°
+DIST_SEGURA   = 0.10   # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
 NUMERO_ESCENA = 2      # número de escena a ejecutar (1-6). Cambiar aquí para probar diferentes escenarios
 
@@ -35,116 +31,137 @@ class NavigationNode(Node):
     def __init__(self):
         """
         Nodo ROS2 que planifica y ejecuta un camino geométrico autónomo.
-        Máquina de estados principal
-        ────────────────────────────
-        ESPERANDO_COMANDO  →  ROTANDO  →  MOVIENDO  →  (repite por cada segmento)
-            →  ROTACION_FINAL  →  RELOCALIZAR  →  DONE
+        
+        Máquina de estados
+        ──────────────────
+        ESPERANDO_COMANDO → ROTANDO → MOVIENDO → (repite por segmento)
+            → ROTACION_FINAL → RELOCALIZAR → DONE
         """
         super().__init__('student_navigation')
         
         # Suscriptores
-        self.odom_sub = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
-        self.lidar_sub = self.create_subscription(LaserScan, 'scan_raw', self.lidar_callback, 10)
+        self.odom_sub  = self.create_subscription(Odometry,   'odom',     self.odom_callback,  10)
+        self.lidar_sub = self.create_subscription(LaserScan,  'scan_raw', self.lidar_callback, 10)
         
         # Publicador
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         
-        # Variables de estado interno
-        self.current_x = 0.0
-        self.current_y = 0.0
+        # Pose actual
+        self.current_x     = 0.0
+        self.current_y     = 0.0
         self.current_theta = 0.0
-        self.last_scan = None
+        self.last_scan     = None
+        
+        # flag explícito de recepción de odometría.
+        self.odom_recibida = False
         
         # Estado del movimiento
-        self.target_theta_abs  = None  # ángulo absoluto objetivo (rad)
-        self.pose_inicial_flag = None  # bandera de inicio para mover_adelante
+        self.target_theta_abs  = None   # ángulo absoluto objetivo (rad)
+        self.pose_inicial_flag = None   # posición de inicio del segmento actual
         
-        # Datos adicionales
+        # Datos de la misión
         self.scene_data    = None
-        self.positions     = []                # [(x,y), …] waypoints en coordenadas mundo
-        self.qf_theta_deg  = 0.0               # orientación final (°)
-        self.path_configs  = []                # lista completa de configs para el archivo .txt
-        self.pos_idx       = 1                 # índice del siguiente waypoint a alcanzar
-        self.numero_escena = NUMERO_ESCENA     # número de escena cargada (1-6)
-        self.segment_dist  = 0.0               # distancia del segmento actual (m)
+        self.positions     = []         # [(x,y), …] waypoints en coordenadas mundo
+        self.qf_theta_deg  = 0.0        # orientación final (°)
+        self.path_configs  = []         # lista de (x,y,θ°) para el archivo .txt
+        self.pos_idx       = 1          # índice del siguiente waypoint a alcanzar
+        self.numero_escena = NUMERO_ESCENA
+        self.segment_dist  = 0.0        # distancia del segmento actual (m)
         
-        # Maquina de estados.
-        self.state = 'ESPERANDO_COMANDO'  # 'ESPERANDO_COMANDO', 'EJECUTANDO_COMANDO'
+        # ── MÉTRICAS DE EJECUCIÓN  ────────────────────────────────────
+        self.t_inicio_ejecucion  = None   # time.perf_counter() al iniciar ROTANDO
+        self.dist_recorrida_total = 0.0   # suma de distancias de segmentos completados
+        self.suma_angular_abs_deg = 0.0   # suma |rotaciones| realizadas
+        self._theta_antes_rotar   = None  # guarda el ángulo antes de cada rotación
+        self.dt_planificacion     = 0.0   # tiempo que tardó el RRT en planificar
+        
+        # Máquina de estados
+        self.state = 'ESPERANDO_COMANDO'
         
         # Temporizadores
         self.create_timer(0.1, self.control_loop)
         self._inicio_timer = self.create_timer(1.0, self._auto_start)
         
+        self.get_logger().info("Proyecto 3 – Nodo RRT iniciado.")
         
-        self.get_logger().info("Proyecto 3 - Nodo RTT iniciado . . .")
-        
-    # =======================================================
+    # ══════════════════════════════════════════════════════════════════════════
     # CALLBACKS DE ROS2
-    # =======================================================
+    # ══════════════════════════════════════════════════════════════════════════
+    
     def odom_callback(self, msg):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
+        x  = msg.pose.pose.position.x
+        y  = msg.pose.pose.position.y
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         theta = 2.0 * math.atan2(qz, qw)
 
-        dist_desde_actual = math.sqrt(
-            (x - self.current_x)**2 + (y - self.current_y)**2
-        )
-
-        if self.current_x != 0.0 or self.current_y != 0.0:
-            if dist_desde_actual > 0.5:
+        # Filtro de saltos bruscos (> 0.5 m entre ticks)
+        if self.odom_recibida:
+            salto = math.hypot(x - self.current_x, y - self.current_y)
+            if salto > 0.5:
                 self.get_logger().warn(
-                    f"Odom descartada: salto de {dist_desde_actual:.2f} m "
+                    f"Odom descartada: salto de {salto:.2f} m "
                     f"({self.current_x:.2f},{self.current_y:.2f}) → ({x:.2f},{y:.2f})",
                     throttle_duration_sec=1.0)
                 return
 
-        self.current_x = x
-        self.current_y = y
+        self.current_x     = x
+        self.current_y     = y
         self.current_theta = theta
+        self.odom_recibida = True 
 
     def lidar_callback(self, msg):
         self.last_scan = msg
 
-
-
     # ══════════════════════════════════════════════════════════════════════════
     # HELPERS DE MOVIMIENTO
     # ══════════════════════════════════════════════════════════════════════════
-
+    
     def _rotar_a(self, theta_objetivo_rad: float) -> bool:
         """
         Gira hasta alcanzar un ángulo absoluto en el marco mundo.
         Devuelve True cuando la rotación está completa.
+        CAMBIO: registra el ángulo previo la primera vez para medir la rotación.
         """
+        # Guardar ángulo de inicio para contabilizar la rotación ejecutada
+        if self._theta_antes_rotar is None:
+            self._theta_antes_rotar = self.current_theta
+
         cmd, done = calcular_rotacion(
             self.current_theta, theta_objetivo_rad,
             vel_angular_max=VEL_ANGULAR, tolerancia=TOL_ANGULAR
         )
         self.cmd_pub.publish(cmd)
+
+        if done:
+            # Acumular la rotación absoluta ejecutada
+            diff = theta_objetivo_rad - self._theta_antes_rotar
+            diff = math.atan2(math.sin(diff), math.cos(diff))
+            self.suma_angular_abs_deg += abs(math.degrees(diff))
+            self._theta_antes_rotar = None   # resetear para la próxima rotación
+
         return done
 
     def _mover_adelante(self, distancia: float) -> str:
         """
-        Avanza usando odometría real en vez de dead-reckoning por tiempo.
+        Avanza usando odometría real.
         Devuelve: 'EN_RUTA' | 'COMPLETADO' | 'BLOQUEADO'
+
+        CAMBIO: reemplaza el heurístico de distancia al origen por el flag
+        self.odom_recibida para detectar si la odometría ya es válida.
         """
-        # Guardar posición de inicio una sola vez
+        if not self.odom_recibida:
+            return 'EN_RUTA'
+
+        # Guardar posición de inicio del segmento una sola vez
         if self.pose_inicial_flag is None:
-            dist_origen = math.sqrt(self.current_x**2 + self.current_y**2)
-            if dist_origen < 0.1:
-                # Odometría aún no válida, esperar
-                return 'EN_RUTA'
             self.pose_inicial_flag = (self.current_x, self.current_y)
             self.get_logger().info(
                 f"  Inicio segmento en ({self.current_x:.2f}, {self.current_y:.2f})")
 
-        # Distancia recorrida real según odometría
+        # Distancia real recorrida en este segmento
         x0, y0 = self.pose_inicial_flag
-        recorrido = math.sqrt(
-            (self.current_x - x0) ** 2 + (self.current_y - y0) ** 2
-        )
+        recorrido = math.hypot(self.current_x - x0, self.current_y - y0)
 
         # Verificar obstáculos al frente con LiDAR
         cono = obtener_distancias_rango(self.last_scan, -CONO_VISION, CONO_VISION)
@@ -152,30 +169,30 @@ class NavigationNode(Node):
         dist_frente = min(distancias_validas) if distancias_validas else float('inf')
 
         if dist_frente < DIST_SEGURA:
-            self.get_logger().warn(
-                f"  Obstáculo a {dist_frente:.2f} m – BLOQUEADO")
+            self.get_logger().warn(f"  Obstáculo a {dist_frente:.2f} m – BLOQUEADO")
             self.pose_inicial_flag = None
             self.cmd_pub.publish(Twist())
             return 'BLOQUEADO'
 
         if recorrido >= distancia:
+            self.dist_recorrida_total += recorrido   
             self.pose_inicial_flag = None
             self.cmd_pub.publish(Twist())
             return 'COMPLETADO'
 
-        # Seguir avanzando
         cmd = Twist()
         cmd.linear.x = VEL_LINEAL
         self.cmd_pub.publish(cmd)
         return 'EN_RUTA'
+
     # ══════════════════════════════════════════════════════════════════════════
     # PARSEO DE ESCENA
     # ══════════════════════════════════════════════════════════════════════════
-
+    
     def _parsear_escena(self, numero: int) -> dict | None:
         share_dir = get_package_share_directory('proyecto')
         ruta = os.path.join(share_dir, 'data', f'Escena-Problema{numero}.txt')
-
+    
         datos = {'obstaculos': []}
         try:
             with open(ruta, 'r', encoding='utf-8') as f:
@@ -216,127 +233,6 @@ class NavigationNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error parseando escena: {e}")
         return None
-    # ══════════════════════════════════════════════════════════════════════════
-    # PLANIFICADOR A*
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _astar(self, grid, rows: int, cols: int,
-               start_xy: tuple, goal_xy: tuple) -> list | None:
-        """
-        A* 8-conectado sobre la cuadrícula del C-space.
-        Las celdas semi-libres tienen coste doble para incentivar rutas alejadas
-        de los obstáculos (criterio de optimización en seguridad).
-        """
-        start = self._xy_a_celda(*start_xy)
-        goal  = self._xy_a_celda(*goal_xy)
-        # Asegurar que los extremos sean válidos
-        start = self._celda_libre_mas_cercana(grid, rows, cols, start)
-        goal  = self._celda_libre_mas_cercana(grid, rows, cols, goal)
-
-        self.get_logger().info(f"A* → celda inicio {start}, celda meta {goal}")
-
-        DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
-                (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-        def h(a, b):
-            return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-
-        open_set  = [(0.0, start)]
-        g_score   = {start: 0.0}
-        came_from = {}
-
-        while open_set:
-            _, cur = heapq.heappop(open_set)
-
-            if cur == goal:
-                # Reconstruir camino
-                path = []
-                while cur in came_from:
-                    path.append(cur)
-                    cur = came_from[cur]
-                path.append(start)
-                return list(reversed(path))
-
-            for dr, dc in DIRS:
-                nb = (cur[0] + dr, cur[1] + dc)
-                if not (0 <= nb[0] < rows and 0 <= nb[1] < cols):
-                    continue
-                if grid[nb[0]][nb[1]] == 1:     # celda ocupada: no transitable
-                    continue
-
-                coste_movimiento = math.sqrt(dr * dr + dc * dc)
-                if grid[nb[0]][nb[1]] == 2:
-                    coste_movimiento *= 2.0     # penalización zona semi-libre
-
-                ng = g_score[cur] + coste_movimiento
-                if nb not in g_score or ng < g_score[nb]:
-                    g_score[nb]   = ng
-                    came_from[nb] = cur
-                    heapq.heappush(open_set, (ng + h(nb, goal), nb))
-
-        self.get_logger().error("A*: no se encontró camino hacia el objetivo.")
-        return None
-
-    def _celda_libre_mas_cercana(self, grid, rows: int, cols: int, celda: tuple):
-        """BFS desde 'celda' hasta encontrar la celda libre más cercana."""
-        if grid[celda[0]][celda[1]] != 1:
-            return celda
-        q= deque([celda])
-        visited = {celda}
-        while q:
-            r, c = q.popleft()
-            if grid[r][c] != 1:
-                return (r, c)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nb = (r + dr, c + dc)
-                if 0 <= nb[0] < rows and 0 <= nb[1] < cols and nb not in visited:
-                    visited.add(nb)
-                    q.append(nb)
-        return celda
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # SUAVIZADO (visibilidad directa con Bresenham)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _suavizar_camino(self, path: list, grid) -> list:
-        """
-        Elimina waypoints intermedios cuando el segmento resultante es
-        completamente libre (sin celdas ocupadas).
-        """
-        if len(path) <= 2:
-            return path
-        smoothed = [path[0]]
-        i = 0
-        while i < len(path) - 1:
-            j = len(path) - 1
-            while j > i + 1:
-                if self._vision_directa(path[i], path[j], grid):
-                    break
-                j -= 1
-            smoothed.append(path[j])
-            i = j
-        return smoothed
-
-    def _vision_directa(self, p1: tuple, p2: tuple, grid) -> bool:
-        """Bresenham: devuelve True si el segmento p1→p2 no cruza celdas ocupadas."""
-        r1, c1 = p1
-        r2, c2 = p2
-        dr, dc = abs(r2 - r1), abs(c2 - c1)
-        sr, sc = (1 if r2 > r1 else -1), (1 if c2 > c1 else -1)
-        err    = dr - dc
-        r, c   = r1, c1
-        while True:
-            if grid[r][c] == 1:
-                return False
-            if r == r2 and c == c2:
-                return True
-            e2 = 2 * err
-            if e2 > -dc:
-                err -= dc
-                r   += sr
-            if e2 <  dr:
-                err += dr
-                c   += sc
 
     # ══════════════════════════════════════════════════════════════════════════
     # RELOCALIZACIÓN CON LiDAR
@@ -344,61 +240,40 @@ class NavigationNode(Node):
 
     def _relocalizar(self, scene: dict, qf_teo: tuple) -> tuple | None:
         """
-        Calcula la configuración real del robot a partir de las lecturas LiDAR
-        al frente y a la derecha.
-
-        Método:
-        -------
-        Dado el ángulo teórico θ_f, se calculan los vectores unitarios de la
-        dirección 'frente' (f̂) y 'derecha' (r̂) en el marco mundo.
-        Con ray-casting se encuentra el obstáculo más cercano en cada dirección.
-        Luego se plantea el sistema 2×2:
-
-          [fx  fy] [x_act]   [b_f - d_lidar_frente]
-          [rx  ry] [y_act] = [b_r - d_lidar_derecha]
-
-        donde b_f y b_r son las proyecciones escalares del punto de intersección
-        sobre sus respectivos ejes, lo que permite determinar (x_act, y_act).
+        Calcula la configuración real del robot a partir de lecturas LiDAR
+        al frente y a la derecha en qf.
         """
         if self.last_scan is None:
             return None
 
-        # ── Lecturas LiDAR (marco cuerpo: frente=0°, derecha=-90°) ──
         d_f = obtener_distancia_angulo(self.last_scan, 0.0)
         d_r = obtener_distancia_angulo(self.last_scan, math.radians(-90.0))
 
-        # Si el sensor no devuelve dato válido, se usan los valores esperados de la escena
         if not (0 < d_f < float('inf')):
             d_f = scene['dFrente']
         if not (0 < d_r < float('inf')):
             d_r = scene['dDerecha']
 
         theta = math.radians(qf_teo[2])
-
-        # Vectores unitarios en marco mundo
-        fx, fy = math.cos(theta),                  math.sin(theta)                  # frente
-        rx, ry = math.cos(theta - math.pi / 2),    math.sin(theta - math.pi / 2)    # derecha
+        fx, fy = math.cos(theta),              math.sin(theta)
+        rx, ry = math.cos(theta - math.pi/2),  math.sin(theta - math.pi/2)
 
         front_pt = self._raycast(scene, qf_teo[0], qf_teo[1], fx, fy)
         right_pt = self._raycast(scene, qf_teo[0], qf_teo[1], rx, ry)
 
         if front_pt is None or right_pt is None:
             self.get_logger().warn(
-                "Relocalización: no se encontró obstáculo de referencia. "
-                "Verificar que qf esté orientada hacia obstáculos conocidos.")
+                "Relocalización: no se encontró obstáculo de referencia.")
             return None
 
-        # Proyecciones escalares
         b_f = front_pt[0] * fx + front_pt[1] * fy
         b_r = right_pt[0] * rx + right_pt[1] * ry
 
         rhs1 = b_f - d_f
         rhs2 = b_r - d_r
 
-        # Resolver sistema 2×2  (det = fx·ry − fy·rx)
         det = fx * ry - fy * rx
         if abs(det) < 1e-6:
-            # Caso degenerado: usar estimación componente a componente
             x_act = right_pt[0] - d_r * rx
             y_act = front_pt[1] - d_f * fy
         else:
@@ -409,13 +284,9 @@ class NavigationNode(Node):
 
     def _raycast(self, scene: dict, ox: float, oy: float,
                  dx: float, dy: float) -> tuple | None:
-        """
-        Ray casting desde (ox, oy) en dirección (dx, dy).
-        Devuelve el punto de intersección más cercano con paredes u obstáculos.
-        """
-        W, H      = scene['ancho'], scene['alto']
-        best_t    = float('inf')
-        best_pt   = None
+        W, H   = scene['ancho'], scene['alto']
+        best_t = float('inf')
+        best_pt = None
 
         def actualizar(t, px, py):
             nonlocal best_t, best_pt
@@ -423,7 +294,6 @@ class NavigationNode(Node):
                 best_t  = t
                 best_pt = (px, py)
 
-        # Paredes del escenario
         if abs(dx) > 1e-9:
             for wx in (0.0, W):
                 t = (wx - ox) / dx
@@ -433,7 +303,6 @@ class NavigationNode(Node):
                 t = (wy - oy) / dy
                 actualizar(t, ox + t * dx, oy + t * dy)
 
-        # Obstáculos rectangulares
         for obs in scene['obstaculos']:
             x1, y1 = obs['p1']
             x2, y2 = obs['p2']
@@ -456,16 +325,16 @@ class NavigationNode(Node):
                             actualizar(t, px, oy + t * dy)
 
         return best_pt
-
+    
     # ══════════════════════════════════════════════════════════════════════════
     # SALIDA A ARCHIVO
     # ══════════════════════════════════════════════════════════════════════════
-
+    
     def _guardar_camino(self, configs, escena, qf_est=None, q_act=None):
         ruta = os.path.expanduser(f'~/Camino-Escena{escena}.txt')
         try:
             with open(ruta, 'w', encoding='utf-8') as f:
-                f.write("# Camino geométrico solución – Proyecto 2\n")
+                f.write("# Camino geométrico solución – Proyecto 3 (RRT)\n")
                 f.write("# Formato: x,y,theta_deg\n")
                 for cfg in configs:
                     f.write(f"{cfg[0]:.4f},{cfg[1]:.4f},{cfg[2]:.2f}\n")
@@ -481,9 +350,6 @@ class NavigationNode(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def ejecutar_escena(self, numero: int):
-        """
-        Punto de entrada público.  Parsea, planifica y arranca la ejecución.
-        """
         self.numero_escena = numero
 
         # 1. Parsear escena
@@ -493,76 +359,78 @@ class NavigationNode(Node):
         self.scene_data = scene
         q0, qf = scene['q0'], scene['qf']
 
-        # 2. Planificación RTT
-        self.get_logger().info("Planificando con RTT . . .")
-        waypoints_raw, dt = rrt(
-            q0_xy = (q0[0], q0[1]),
-            qf_xy = (qf[0], qf[1]),
-            scene  = scene,
+        # 2. Planificación RRT
+        self.get_logger().info("Planificando con RRT . . .")
+        waypoints_raw, dt_plan = rrt(
+            q0_xy       = (q0[0], q0[1]),
+            qf_xy       = (qf[0], qf[1]),
+            scene       = scene,
             robot_radio = ROBOT_RADIO,
         )
-        
-        # 3. Verificar resultado
+        self.dt_planificacion = dt_plan  
+
         if waypoints_raw is None:
-            self.get_logger().error(f"RRT no encontró solución en {dt:.1f}s. Abortando.")
+            self.get_logger().error(f"RRT no encontró solución en {dt_plan:.1f} s. Abortando.")
             return
-        
-        self.get_logger().info(f"RRT encontró camino con {len(waypoints_raw)} waypoints en {dt:.3f} s.")
-        
-        # 4. Suavizado de camino
+
+        self.get_logger().info(
+            f"RRT: {len(waypoints_raw)} waypoints crudos en {dt_plan:.3f} s.")
+
+        # 3. Suavizado
         waypoints_suaves = suavizar(waypoints_raw, scene, ROBOT_RADIO)
-        self.get_logger().info(f"Suavizado: {len(waypoints_raw)} → {len(waypoints_suaves)} waypoints")
-        
-        # 5. Convertir a coordenadas mundo
-        positions = [(q0[0], q0[1])]                            # inicio exacto
+        self.get_logger().info(
+            f"Suavizado: {len(waypoints_raw)} → {len(waypoints_suaves)} waypoints")
+
+        # 4. Construir lista de posiciones para la ejecución
+        positions = [(q0[0], q0[1])]
         for wp in waypoints_suaves[1:-1]:
             positions.append(wp)
-        positions.append((qf[0], qf[1]))                        # fin exacto
-        self.positions   = positions
+        positions.append((qf[0], qf[1]))
+        self.positions    = positions
         self.qf_theta_deg = qf[2]
-
 
         self.get_logger().info("Waypoints planificados:")
         for i, pos in enumerate(positions):
             self.get_logger().info(f"  [{i}] x={pos[0]:.3f}, y={pos[1]:.3f}")
-        # 6. Construir lista de configuraciones para el archivo .txt
-        # Formato: (pos_rotación, pos_llegada) por segmento + rotación final
+
+        # 5. Construir path_configs para el archivo .txt
         self.path_configs = []
         for i in range(len(positions) - 1):
             x1, y1 = positions[i]
             x2, y2 = positions[i + 1]
             theta_seg = math.degrees(math.atan2(y2 - y1, x2 - x1))
-            self.path_configs.append((x1, y1, theta_seg))   # qrot_i-i+1
-            self.path_configs.append((x2, y2, theta_seg))   # q_i+1
-        self.path_configs.append((qf[0], qf[1], qf[2]))     # qrot_n (orientación final)
+            self.path_configs.append((x1, y1, theta_seg))
+            self.path_configs.append((x2, y2, theta_seg))
+        self.path_configs.append((qf[0], qf[1], qf[2]))
 
         self._guardar_camino(self.path_configs, numero)
 
-        # 7. Iniciar ejecución
+        # 6. Iniciar ejecución
         self.pos_idx = 1
         self._preparar_siguiente_segmento()
         if self.target_theta_abs is None:
-            self.get_logger().error("target_theta_abs no se pudo calcular. Abortando.")
+            self.get_logger().error("target_theta_abs no calculado. Abortando.")
             return
-        
-        self.state = 'ROTANDO'
 
+        # NUEVO: registrar tiempo de inicio de ejecución para mejor toma de metricas
+        self.t_inicio_ejecucion = time.perf_counter()
+
+        self.state = 'ROTANDO'
         self.get_logger().info(
             f"Misión iniciada: {len(positions) - 1} segmentos, "
-            f"distancia total ≈ "
-            f"{sum(math.sqrt((positions[i+1][0]-positions[i][0])**2+(positions[i+1][1]-positions[i][1])**2) for i in range(len(positions)-1)):.2f} m"
+            f"distancia planificada ≈ "
+            f"{sum(math.hypot(positions[i+1][0]-positions[i][0], positions[i+1][1]-positions[i][1]) for i in range(len(positions)-1)):.2f} m"
         )
 
     def _preparar_siguiente_segmento(self):
-        """Calcula heading y distancia del segmento actual."""
         if self.pos_idx < len(self.positions):
             x1, y1 = self.positions[self.pos_idx - 1]
             x2, y2 = self.positions[self.pos_idx]
             self.target_theta_abs = math.atan2(y2 - y1, x2 - x1)
-            self.segment_dist     = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            self.segment_dist     = math.hypot(x2 - x1, y2 - y1)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # BUCLE DE CONTROL PRINCIPAL  
+    # BUCLE DE CONTROL PRINCIPAL
     # ══════════════════════════════════════════════════════════════════════════
 
     def control_loop(self):
@@ -575,16 +443,15 @@ class NavigationNode(Node):
             self.get_logger().warn("target_theta_abs es None", throttle_duration_sec=2.0)
             return
 
-        # Log del estado actual cada 2 segundos
         self.get_logger().info(
             f"Estado: {self.state} | "
             f"pos=({self.current_x:.2f},{self.current_y:.2f}) | "
-            f"theta={math.degrees(self.current_theta):.1f}° | "
-            f"target={math.degrees(self.target_theta_abs):.1f}°",
+            f"θ={math.degrees(self.current_theta):.1f}° | "
+            f"objetivo={math.degrees(self.target_theta_abs):.1f}°",
             throttle_duration_sec=2.0
         )
 
-        # ── ROTANDO: alinear hacia el siguiente waypoint ──────────────────────
+        # ── ROTANDO ───────────────────────────────────────────────────────────
         if self.state == 'ROTANDO':
             if self._rotar_a(self.target_theta_abs):
                 self.get_logger().info(
@@ -592,36 +459,34 @@ class NavigationNode(Node):
                     f"(segmento {self.pos_idx}/{len(self.positions)-1})")
                 self.state = 'MOVIENDO'
 
-        # ── MOVIENDO: avanzar al siguiente waypoint ───────────────────────────
+        # ── MOVIENDO ──────────────────────────────────────────────────────────
         elif self.state == 'MOVIENDO':
             estado = self._mover_adelante(self.segment_dist)
 
             if estado == 'COMPLETADO':
                 self.get_logger().info(
-                    f"  → Segmento {self.pos_idx} completado "
-                    f"({self.segment_dist:.2f} m).")
+                    f"  → Segmento {self.pos_idx} completado ({self.segment_dist:.2f} m).")
                 self.pos_idx += 1
                 self._avanzar_estado_post_movimiento()
 
             elif estado == 'BLOQUEADO':
                 self.get_logger().warn(
-                f"  ⚠ Segmento {self.pos_idx} BLOQUEADO - replanificando desde posición actual.")
+                    f"  ⚠ Segmento {self.pos_idx} BLOQUEADO – replanificando.")
                 self._replanificar()
 
-        # ── ROTACION FINAL: girar a la orientación de qf ─────────────────────
+        # ── ROTACION_FINAL ────────────────────────────────────────────────────
         elif self.state == 'ROTACION_FINAL':
             if self._rotar_a(math.radians(self.qf_theta_deg)):
                 self.get_logger().info(
                     f"  → Rotación final OK  θ={self.qf_theta_deg:.1f}°")
                 self.state = 'RELOCALIZAR'
 
-        # ── RELOCALIZAR: se ejecuta una sola vez ──────────────────────────────
+        # ── RELOCALIZAR ───────────────────────────────────────────────────────
         elif self.state == 'RELOCALIZAR':
             self._reportar_y_relocalizar()
             self.state = 'DONE'
 
     def _avanzar_estado_post_movimiento(self):
-        """Decide si continuar con el siguiente segmento o pasar a rotación final."""
         if self.pos_idx < len(self.positions):
             self._preparar_siguiente_segmento()
             self.state = 'ROTANDO'
@@ -630,8 +495,9 @@ class NavigationNode(Node):
 
     def _replanificar(self):
         """
-        Replantea el camino desde la posición actual (odometría) hasta qf.
-        Se invoca cuando un segmento queda bloqueado por un obstáculo.
+        Replantea el camino desde la posición actual hasta qf.
+        CAMBIO: reemplaza self.path_configs en lugar de acumular sobre él,
+        lo que antes generaba un archivo .txt con configs duplicadas/incorrectas.
         """
         scene = self.scene_data
         if scene is None:
@@ -639,31 +505,32 @@ class NavigationNode(Node):
             self.state = 'DONE'
             return
 
-        qf = scene['qf']
+        qf         = scene['qf']
         pos_actual = (self.current_x, self.current_y)
 
         self.get_logger().info(
             f"  Replanificando desde ({pos_actual[0]:.2f}, {pos_actual[1]:.2f}) "
             f"→ qf=({qf[0]:.2f}, {qf[1]:.2f})")
 
-        # Replanificar con RRT desde la posición actual (odometría) hasta qf
-        waypoints_raw, dt = rrt(pos_actual, (qf[0], qf[1]),
-                                scene, ROBOT_RADIO)
+        waypoints_raw, dt_plan = rrt(pos_actual, (qf[0], qf[1]),
+                                     scene, ROBOT_RADIO)
         if waypoints_raw is None:
             self.get_logger().error("Replanificación RRT fallida. Abortando.")
             self.state = 'DONE'
             return
 
-        # Suavizar el nuevo camino
         waypoints_suave = suavizar(waypoints_raw, scene, ROBOT_RADIO)
-
         new_pos = [pos_actual] + list(waypoints_suave[1:-1]) + [(qf[0], qf[1])]
+
         self.positions = new_pos
         self.pos_idx   = 1
 
-        for i in range(len(new_pos)-1):
-            x1,y1 = new_pos[i]; x2,y2 = new_pos[i+1]
-            th = math.degrees(math.atan2(y2-y1, x2-x1))
+        # CAMBIO: resetear path_configs en lugar de append (bug original)
+        self.path_configs = []
+        for i in range(len(new_pos) - 1):
+            x1, y1 = new_pos[i]
+            x2, y2 = new_pos[i + 1]
+            th = math.degrees(math.atan2(y2 - y1, x2 - x1))
             self.path_configs.append((x1, y1, th))
             self.path_configs.append((x2, y2, th))
         self.path_configs.append((qf[0], qf[1], qf[2]))
@@ -671,8 +538,7 @@ class NavigationNode(Node):
 
         self._preparar_siguiente_segmento()
         self.state = 'ROTANDO'
-        
-        
+
     # ══════════════════════════════════════════════════════════════════════════
     # REPORTE FINAL Y RELOCALIZACIÓN
     # ══════════════════════════════════════════════════════════════════════════
@@ -683,13 +549,15 @@ class NavigationNode(Node):
         qf_est = (self.current_x,
                   self.current_y,
                   math.degrees(self.current_theta))
+        q_act = self._relocalizar(scene, qf_teo)
 
-        q_act  = self._relocalizar(scene, qf_teo)
+        d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+        a = lambda a, b: min(abs(a[2] - b[2]), 360 - abs(a[2] - b[2]))
 
-        d = lambda a,b: math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2)
-        a = lambda a,b: min(abs(a[2]-b[2]), 360-abs(a[2]-b[2]))
-
-        sep = "═" * 60
+        # NUEVO: tiempo total de ejecución
+        t_ejecucion = (time.perf_counter() - self.t_inicio_ejecucion
+                       if self.t_inicio_ejecucion else 0.0)
+        sep = "═" * 65
         self.get_logger().info(sep)
         self.get_logger().info(f"  RESULTADOS RRT – Escena {self.numero_escena}")
         self.get_logger().info(sep)
@@ -698,23 +566,28 @@ class NavigationNode(Node):
         self.get_logger().info(
             f"  qf estimado : x={qf_est[0]:.4f} y={qf_est[1]:.4f} θ={qf_est[2]:.2f}°")
         self.get_logger().info(
-            f"  Error teo→est: {d(qf_teo,qf_est):.4f}m / {a(qf_teo,qf_est):.2f}°")
+            f"  Error teo→est: {d(qf_teo, qf_est):.4f} m / {a(qf_teo, qf_est):.2f}°")
         if q_act:
             self.get_logger().info(
                 f"  q_act real  : x={q_act[0]:.4f} y={q_act[1]:.4f} θ={q_act[2]:.2f}°")
             self.get_logger().info(
-                f"  Error est→act: {d(qf_est,q_act):.4f}m / {a(qf_est,q_act):.2f}°")
+                f"  Error est→act: {d(qf_est, q_act):.4f} m / {a(qf_est, q_act):.2f}°")
+        # NUEVO: bloque de métricas para la tabla del informe
+        self.get_logger().info("─" * 65)
+        self.get_logger().info("  MÉTRICAS PARA TABLA COMPARATIVA:")
+        self.get_logger().info(
+            f"  Distancia lineal recorrida    : {self.dist_recorrida_total:.4f} m")
+        self.get_logger().info(
+            f"  Suma absoluta angular         : {self.suma_angular_abs_deg:.2f}°")
+        self.get_logger().info(
+            f"  Tiempo generación (RRT)       : {self.dt_planificacion:.4f} s")
+        self.get_logger().info(
+            f"  Tiempo ejecución (simulación) : {t_ejecucion:.2f} s")
         self.get_logger().info(sep)
-        
-        # Guardar resultados en el mismo archivo del camino para análisis posterior
         self._guardar_camino(self.path_configs, self.numero_escena, qf_est, q_act)
-        # Frenar el robot al finalizar
-        self.cmd_pub.publish(Twist())
-
+        self.cmd_pub.publish(Twist())   # frenar el robot
+        
     def _auto_start(self):
-        """
-        Función de callback del timer de inicio automático. Se ejecuta una sola vez al iniciar el nodo, y lanza la ejecución de la escena.
-        """
         self._inicio_timer.cancel()
         self.ejecutar_escena(self.numero_escena)
 
@@ -722,19 +595,17 @@ class NavigationNode(Node):
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = NavigationNode()
-    node.numero_escena = NUMERO_ESCENA     # propagar la escena al nodo
+    node.numero_escena = NUMERO_ESCENA
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.cmd_pub.publish(Twist())      # detener motores al salir
+        node.cmd_pub.publish(Twist())
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

@@ -1,18 +1,17 @@
 """
 planner_rrt.py  -  Proyecto 3, ISIS4826 Robótica Móvil
-Planificador RRT en espacio continuo.
+Planificador RRT con mejoras de calidad de camino (RRT* lite).
 """
 
 import math
 import random
 import time
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INFLADO DE OBSTÁCULOS  (C-space)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _inflar_obstaculo(p1: tuple, p2: tuple, radio: float) -> tuple:
-    """
-    Recibe las dos esquinas de un obstáculo rectangular del proyecto 2
-    y devuelve (xmin, ymin, xmax, ymax) inflado por 'radio'.
-    """
     x1, y1 = p1
     x2, y2 = p2
     return (min(x1, x2) - radio,
@@ -22,10 +21,6 @@ def _inflar_obstaculo(p1: tuple, p2: tuple, radio: float) -> tuple:
 
 
 def _inflar_paredes(ancho: float, alto: float, radio: float) -> list:
-    """
-    Devuelve 4 rectángulos inflados que representan las paredes del escenario.
-    Se modelan como franjas que invaden el espacio libre por 'radio'.
-    """
     return [
         (     -1.0,   -1.0,   radio,   alto + 1.0),   # pared izquierda
         (ancho-radio, -1.0, ancho+1.0, alto + 1.0),   # pared derecha
@@ -35,44 +30,26 @@ def _inflar_paredes(ancho: float, alto: float, radio: float) -> list:
 
 
 def _construir_obstaculos(scene: dict, robot_radio: float) -> list:
-    """
-    Devuelve la lista de todos los rectángulos inflados
-    (obstáculos + paredes) como tuplas (xmin, ymin, xmax, ymax).
-    """
-    obs = [_inflar_obstaculo(o['p1'], o['p2'], robot_radio)
-           for o in scene['obstaculos']]
+    obs = [_inflar_obstaculo(o['p1'], o['p2'], robot_radio)for o in scene['obstaculos']]
     obs += _inflar_paredes(scene['ancho'], scene['alto'], robot_radio)
     return obs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GEOMETRÍA DE COLISIÓN — AABB puro, sin librerías externas
+# GEOMETRÍA DE COLISIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _punto_en_rect(px: float, py: float, rect: tuple) -> bool:
-    """True si el punto (px, py) está dentro del rectángulo."""
     xmin, ymin, xmax, ymax = rect
     return xmin <= px <= xmax and ymin <= py <= ymax
 
 
 def _segmento_intersecta_rect(p1: tuple, p2: tuple, rect: tuple) -> bool:
-    """
-    Detecta si el segmento p1→p2 intersecta el rectángulo (AABB).
-
-    Algoritmo: Liang-Barsky.
-    Recorta paramétricamente el segmento contra los 4 semiplanos del
-    rectángulo. Si el intervalo paramétrico [t0, t1] no queda vacío,
-    hay intersección.
-
-    Ventaja: maneja correctamente los casos en que uno o ambos extremos
-    están dentro del rectángulo, o el segmento lo atraviesa.
-    """
+    """Determina si el segmento p1-p2 intersecta el rectángulo definido por rect."""
     xmin, ymin, xmax, ymax = rect
     dx = p2[0] - p1[0]
     dy = p2[1] - p1[1]
 
-    # p·t <= q  para cada semiplano
-    # Orden: izquierda, derecha, abajo, arriba
     p_vals = [-dx,  dx, -dy,  dy]
     q_vals = [p1[0] - xmin,
               xmax  - p1[0],
@@ -80,27 +57,20 @@ def _segmento_intersecta_rect(p1: tuple, p2: tuple, rect: tuple) -> bool:
               ymax  - p1[1]]
 
     t0, t1 = 0.0, 1.0
-
     for p, q in zip(p_vals, q_vals):
         if p == 0.0:
-            # Segmento paralelo a este borde
             if q < 0.0:
-                return False   # completamente fuera de este semiplano
+                return False
         elif p < 0.0:
             t0 = max(t0, q / p)
         else:
             t1 = min(t1, q / p)
-
         if t0 > t1:
-            return False   # intervalo vacío → sin intersección
-
+            return False
     return True
 
 
 def _es_libre(p1: tuple, p2: tuple, obstaculos_inflados: list) -> bool:
-    """
-    True si el segmento p1→p2 no intersecta ningún obstáculo inflado.
-    """
     for rect in obstaculos_inflados:
         if _segmento_intersecta_rect(p1, p2, rect):
             return False
@@ -108,7 +78,6 @@ def _es_libre(p1: tuple, p2: tuple, obstaculos_inflados: list) -> bool:
 
 
 def _punto_libre(p: tuple, obstaculos_inflados: list) -> bool:
-    """True si el punto p no está dentro de ningún obstáculo inflado."""
     for rect in obstaculos_inflados:
         if _punto_en_rect(p[0], p[1], rect):
             return False
@@ -124,24 +93,28 @@ def _distancia(a: tuple, b: tuple) -> float:
 
 
 def _extender(q_near: tuple, q_rand: tuple, delta: float) -> tuple:
-    """Avanza δ metros desde q_near en dirección a q_rand."""
+    """
+    Avanza hasta delta metros desde q_near hacia q_rand.
+    CAMBIO: si q_rand ya está a menos de delta, se llega exactamente
+    a q_rand (delta adaptativo). Esto evita sobrepasar la meta.
+    """
     d = _distancia(q_near, q_rand)
     if d < 1e-9:
         return q_near
-    t = min(delta / d, 1.0)
+    t = min(delta / d, 1.0)       # t=1.0 si q_rand está más cerca que delta
     return (q_near[0] + t * (q_rand[0] - q_near[0]),
             q_near[1] + t * (q_rand[1] - q_near[1]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALGORITMO RRT
+# ALGORITMO RRT  (con reconexión local RRT* lite)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Constantes por defecto
 DELTA      = 0.30    # m  – paso de extensión
 TOL_META   = 0.25    # m  – radio de captura de la meta
-MAX_ITER   = 12_000  # iteraciones máximas
-SESGO_META = 0.10    # fracción de muestras hacia qf
+MAX_ITER   = 15_000  # CAMBIO: aumentado de 12_000 a 15_000 para escenas difíciles
+SESGO_META = 0.12    # CAMBIO: aumentado levemente (0.10 → 0.12) para convergencia más rápida
+RADIO_REWIRE = 0.60  # m  – radio de vecindad para reconexión RRT* lite
 
 
 def rrt(q0_xy: tuple,
@@ -154,18 +127,30 @@ def rrt(q0_xy: tuple,
         sesgo: float    = SESGO_META,
         semilla: int    = None) -> tuple:
     """
-    Planificador RRT.
+    Planificador RRT con reconexión local (RRT* lite).
+
+    CAMBIO principal respecto a la versión original:
+    ─────────────────────────────────────────────────
+    Después de agregar q_new al árbol, se buscan todos los nodos dentro
+    de RADIO_REWIRE metros.  Para cada vecino, si el camino
+      q0 → ... → q_new → vecino
+    es más corto que el camino actual
+      q0 → ... → vecino
+    se reconecta el vecino para que su padre sea q_new.
+
+    Esto reduce zigzags sin el coste completo de RRT*, y produce
+    caminos más cortos que el RRT básico antes del suavizado.
 
     Parámetros
     ----------
     q0_xy, qf_xy  : (x, y) inicio y fin en metros
-    scene         : dict de _parsear_escena() — necesita 'ancho','alto','obstaculos'
+    scene         : dict parseado de _parsear_escena()
     robot_radio   : radio de inflado de obstáculos (m)
     delta         : longitud de paso máximo por iteración (m)
     tol_meta      : distancia para considerar que llegamos a qf (m)
     max_iter      : número máximo de iteraciones
     sesgo         : fracción de muestras dirigidas directamente a qf
-    semilla       : para reproducibilidad (None = aleatoria)
+    semilla       : para reproducibilidad (None = aleatorio, recomendado)
 
     Retorna
     -------
@@ -178,21 +163,20 @@ def rrt(q0_xy: tuple,
     alto  = scene['alto']
     t0    = time.perf_counter()
 
-    # Construir todos los obstáculos inflados una sola vez
     obs_inf = _construir_obstaculos(scene, robot_radio)
 
-    # Validar que q0 y qf estén en espacio libre
     for q, nombre in [(q0_xy, 'q0'), (qf_xy, 'qf')]:
         if not _punto_libre(q, obs_inf):
             raise ValueError(
                 f"[RRT] {nombre}={q} cae dentro de un obstáculo inflado. "
                 f"Reducir robot_radio ({robot_radio} m) o corregir la escena.")
 
-    # Árbol: lista de nodos y tabla de padres
+    # Árbol
     nodos  = [q0_xy]
-    padres = {0: None}    # índice → índice del padre
+    padres = {0: None}
+    costos = {0: 0.0}    # NUEVO: costo acumulado desde q0 para cada nodo
 
-    for it in range(max_iter):
+    for _ in range(max_iter):
 
         # ── 1. Muestreo con sesgo hacia la meta ──────────────────────────────
         if random.random() < sesgo:
@@ -201,12 +185,12 @@ def rrt(q0_xy: tuple,
             q_rand = (random.uniform(0.0, ancho),
                       random.uniform(0.0, alto))
 
-        # ── 2. Nodo más cercano del árbol ─────────────────────────────────────
+        # ── 2. Nodo más cercano ───────────────────────────────────────────────
         idx_near = min(range(len(nodos)),
                        key=lambda i: _distancia(nodos[i], q_rand))
         q_near   = nodos[idx_near]
 
-        # ── 3. Extensión ──────────────────────────────────────────────────────
+        # ── 3. Extensión (delta adaptativo) ───────────────────────────────────
         q_new = _extender(q_near, q_rand, delta)
 
         # ── 4. Verificación de colisión ───────────────────────────────────────
@@ -214,16 +198,43 @@ def rrt(q0_xy: tuple,
             continue
 
         # ── 5. Agregar al árbol ───────────────────────────────────────────────
-        idx_new = len(nodos)
+        idx_new  = len(nodos)
         nodos.append(q_new)
-        padres[idx_new] = idx_near
 
-        # ── 6. Comprobar si alcanzamos la meta ────────────────────────────────
+        # Elegir el mejor padre dentro del radio de rewire
+        # (puede ser q_near u otro vecino más barato)
+        mejor_padre = idx_near
+        mejor_costo = costos[idx_near] + _distancia(q_near, q_new)
+
+        for idx_v, q_v in enumerate(nodos[:-1]):   # sin incluir q_new
+            if _distancia(q_v, q_new) < RADIO_REWIRE:
+                costo_via_v = costos[idx_v] + _distancia(q_v, q_new)
+                if costo_via_v < mejor_costo and _es_libre(q_v, q_new, obs_inf):
+                    mejor_padre = idx_v
+                    mejor_costo = costo_via_v
+
+        padres[idx_new] = mejor_padre
+        costos[idx_new] = mejor_costo
+
+        # ── 6. Reconexión (rewire) de vecinos ─────────────────────────────────
+        # NUEVO: si pasar por q_new mejora el costo de algún vecino, reconectar
+        for idx_v, q_v in enumerate(nodos[:-1]):
+            if idx_v == mejor_padre:
+                continue
+            if _distancia(q_new, q_v) < RADIO_REWIRE:
+                costo_via_new = costos[idx_new] + _distancia(q_new, q_v)
+                if costo_via_new < costos.get(idx_v, float('inf')):
+                    if _es_libre(q_new, q_v, obs_inf):
+                        padres[idx_v] = idx_new
+                        costos[idx_v] = costo_via_new
+
+        # ── 7. Comprobar si alcanzamos la meta ────────────────────────────────
         if (_distancia(q_new, qf_xy) <= tol_meta
                 and _es_libre(q_new, qf_xy, obs_inf)):
             idx_qf = len(nodos)
             nodos.append(qf_xy)
             padres[idx_qf] = idx_new
+            costos[idx_qf] = costos[idx_new] + _distancia(q_new, qf_xy)
             dt     = time.perf_counter() - t0
             camino = _reconstruir(nodos, padres, idx_qf)
             return camino, dt
@@ -233,7 +244,6 @@ def rrt(q0_xy: tuple,
 
 
 def _reconstruir(nodos: list, padres: dict, idx_final: int) -> list:
-    """Recorre el árbol hacia atrás para obtener el camino desde q0 a qf."""
     camino, idx = [], idx_final
     while idx is not None:
         camino.append(nodos[idx])
@@ -243,7 +253,7 @@ def _reconstruir(nodos: list, padres: dict, idx_final: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUAVIZADO GREEDY SHORTCUT
+# SUAVIZADO  (greedy shortcut)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def suavizar(waypoints: list,
@@ -251,10 +261,8 @@ def suavizar(waypoints: list,
              robot_radio: float,
              max_pasadas: int = 500) -> list:
     """
-    Elimina waypoints intermedios cuando el atajo directo es libre de obstáculos.
+    Elimina waypoints intermedios cuando el atajo directo es libre.
     Equivalente continuo al suavizado Bresenham del proyecto 2.
-
-    Complejidad por pasada: O(n) — converge rápido para caminos RRT típicos.
     """
     obs_inf = _construir_obstaculos(scene, robot_radio)
     suave   = list(waypoints)
@@ -264,11 +272,74 @@ def suavizar(waypoints: list,
         i = 0
         while i < len(suave) - 2:
             if _es_libre(suave[i], suave[i + 2], obs_inf):
-                suave.pop(i + 1)   # eliminar waypoint intermedio redundante
+                suave.pop(i + 1)
                 cambio = True
             else:
                 i += 1
         if not cambio:
-            break   # convergió, no hay más mejoras posibles
+            break
 
     return suave
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MÉTRICAS DE CAMINO  
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calcular_longitud_camino(waypoints: list) -> float:
+    """
+    Retorna la longitud total del camino geométrico en metros.
+
+    NUEVO: necesario para la columna 'Distancia lineal recorrida' del informe.
+    """
+    total = 0.0
+    for i in range(len(waypoints) - 1):
+        total += _distancia(waypoints[i], waypoints[i + 1])
+    return total
+
+
+def calcular_suma_angular(waypoints: list, theta_inicial_deg: float = 0.0,
+                          theta_final_deg: float = 0.0) -> float:
+    """
+    Suma absoluta de todas las rotaciones del camino (en grados).
+
+    Incluye:
+    - La rotación inicial desde theta_inicial_deg hasta el heading del
+      primer segmento.
+    - Cada giro entre segmentos consecutivos.
+    - La rotación final desde el último heading hasta theta_final_deg.
+
+    NUEVO: necesario para la columna 'Suma absoluta angular' del informe.
+    """
+    if len(waypoints) < 2:
+        return 0.0
+
+    # Headings de cada segmento (en grados)
+    headings = []
+    for i in range(len(waypoints) - 1):
+        dx = waypoints[i + 1][0] - waypoints[i][0]
+        dy = waypoints[i + 1][1] - waypoints[i][1]
+        headings.append(math.degrees(math.atan2(dy, dx)))
+
+    suma = 0.0
+
+    # Rotación inicial (de la orientación de partida al primer heading)
+    diff_ini = headings[0] - theta_inicial_deg
+    diff_ini = math.degrees(math.atan2(math.sin(math.radians(diff_ini)),
+                                       math.cos(math.radians(diff_ini))))
+    suma += abs(diff_ini)
+
+    # Giros entre segmentos consecutivos
+    for i in range(len(headings) - 1):
+        diff = headings[i + 1] - headings[i]
+        diff = math.degrees(math.atan2(math.sin(math.radians(diff)),
+                                       math.cos(math.radians(diff))))
+        suma += abs(diff)
+
+    # Rotación final (del último heading a la orientación destino)
+    diff_fin = theta_final_deg - headings[-1]
+    diff_fin = math.degrees(math.atan2(math.sin(math.radians(diff_fin)),
+                                       math.cos(math.radians(diff_fin))))
+    suma += abs(diff_fin)
+
+    return suma
