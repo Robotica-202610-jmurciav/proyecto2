@@ -185,8 +185,13 @@ class NavigationNode(Node):
         # ── Avanzar con velocidad proporcional a la distancia restante ────────
         # (frena suavemente al acercarse al waypoint)
         vel = min(VEL_LINEAL, max(0.12, dist_restante * 1.2))
+        ang_hacia_target = math.atan2(ty - self.current_y, tx - self.current_x)
+        error_angular = ang_hacia_target - self.current_theta
+        error_angular = math.atan2(math.sin(error_angular), math.cos(error_angular)) # Normalizar
+
         cmd = Twist()
         cmd.linear.x = vel
+        cmd.angular.z = 0.5 * error_angular # Ganancia P simple para mantener el rumbo
         self.cmd_pub.publish(cmd)
         return 'EN_RUTA'
 

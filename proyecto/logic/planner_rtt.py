@@ -227,6 +227,7 @@ def rrt(q0_xy: tuple,
                     if _es_libre(q_new, q_v, obs_inf):
                         padres[idx_v] = idx_new
                         costos[idx_v] = costo_via_new
+                        _propagar_costos(idx_v, nodos, padres, costos)  # actualizar descendientes
 
         # ── 7. Comprobar si alcanzamos la meta ────────────────────────────────
         if (_distancia(q_new, qf_xy) <= tol_meta
@@ -343,3 +344,21 @@ def calcular_suma_angular(waypoints: list, theta_inicial_deg: float = 0.0,
     suma += abs(diff_fin)
 
     return suma
+
+def _propagar_costos(idx_padre: int, nodos: list, padres: dict, costos: dict):
+    """
+    Recorre recursivamente el árbol de forma descendente para actualizar
+    el costo de todos los nodos que dependen del 'idx_padre' tras un rewire.
+    """
+    for idx_hijo, p in padres.items():
+        if p == idx_padre:
+            # 1. Calcular la distancia geométrica entre el padre y este hijo
+            x1, y1 = nodos[idx_padre]
+            x2, y2 = nodos[idx_hijo]
+            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            
+            # 2. El nuevo costo del hijo es el costo del padre más la distancia
+            costos[idx_hijo] = costos[idx_padre] + dist
+            
+            # 3. Propagar recursivamente a los hijos de este hijo (descendientes)
+            _propagar_costos(idx_hijo, nodos, padres, costos)
