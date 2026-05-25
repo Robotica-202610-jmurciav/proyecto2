@@ -22,7 +22,10 @@ VEL_ANGULAR   = 0.2    # rad/s
 TOL_ANGULAR   = 0.15   # rad ≈ 8.6°
 DIST_SEGURA   = 0.10   # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
-NUMERO_ESCENA = 4      # número de escena a ejecutar (1-6). Cambiar aquí para probar diferentes escenarios
+NUMERO_ESCENA = 2      # número de escena a ejecutar (1-6)
+
+TOL_POSICION   = 0.15  # m  – radio de captura del waypoint
+DRIFT_MAX_REPLAN = 0.25  # m
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -31,34 +34,28 @@ class NavigationNode(Node):
     def __init__(self):
         """
         Nodo ROS2 que planifica y ejecuta un camino geométrico autónomo.
-        
         Máquina de estados
         ──────────────────
         ESPERANDO_COMANDO → ROTANDO → MOVIENDO → (repite por segmento)
             → ROTACION_FINAL → RELOCALIZAR → DONE
         """
         super().__init__('student_navigation')
-        
         # Suscriptores
         self.odom_sub  = self.create_subscription(Odometry,   'odom',     self.odom_callback,  10)
         self.lidar_sub = self.create_subscription(LaserScan,  'scan_raw', self.lidar_callback, 10)
-        
         # Publicador
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        
         # Pose actual
         self.current_x     = 0.0
         self.current_y     = 0.0
         self.current_theta = 0.0
         self.last_scan     = None
-        
-        # flag explícito de recepción de odometría.
         self.odom_recibida = False
-        
+
         # Estado del movimiento
         self.target_theta_abs  = None   # ángulo absoluto objetivo (rad)
         self.pose_inicial_flag = None   # posición de inicio del segmento actual
-        
+
         # Datos de la misión
         self.scene_data    = None
         self.positions     = []         # [(x,y), …] waypoints en coordenadas mundo
@@ -66,28 +63,25 @@ class NavigationNode(Node):
         self.path_configs  = []         # lista de (x,y,θ°) para el archivo .txt
         self.pos_idx       = 1          # índice del siguiente waypoint a alcanzar
         self.numero_escena = NUMERO_ESCENA
-        self.segment_dist  = 0.0        # distancia del segmento actual (m)
-        
-        # ── MÉTRICAS DE EJECUCIÓN  ────────────────────────────────────
+        self.segment_dist      = 0.0    # distancia del segmento actual (m)
+        self.segment_target_xy = None   # destino (x,y) del segmento actual
+
+        # ── MÉTRICAS DE EJECUCIÓN ────────────────────────────────────
+        # Necesarias para la tabla comparativa del informe.
         self.t_inicio_ejecucion  = None   # time.perf_counter() al iniciar ROTANDO
         self.dist_recorrida_total = 0.0   # suma de distancias de segmentos completados
         self.suma_angular_abs_deg = 0.0   # suma |rotaciones| realizadas
         self._theta_antes_rotar   = None  # guarda el ángulo antes de cada rotación
         self.dt_planificacion     = 0.0   # tiempo que tardó el RRT en planificar
-        
         # Máquina de estados
         self.state = 'ESPERANDO_COMANDO'
-        
         # Temporizadores
         self.create_timer(0.1, self.control_loop)
         self._inicio_timer = self.create_timer(1.0, self._auto_start)
-        
         self.get_logger().info("Proyecto 3 – Nodo RRT iniciado.")
-        
     # ══════════════════════════════════════════════════════════════════════════
     # CALLBACKS DE ROS2
     # ══════════════════════════════════════════════════════════════════════════
-    
     def odom_callback(self, msg):
         x  = msg.pose.pose.position.x
         y  = msg.pose.pose.position.y
@@ -95,6 +89,11 @@ class NavigationNode(Node):
         qw = msg.pose.pose.orientation.w
         theta = 2.0 * math.atan2(qz, qw)
 
+        distancia_nueva_al_origen = math.hypot(x, y)
+        distancia_actual_al_origen = math.hypot(self.current_x, self.current_y)
+        if distancia_nueva_al_origen < 0.05 and distancia_actual_al_origen > 0.30:
+            # Lectura de "reinicio de frame": ignorar silenciosamente
+            return
         # Filtro de saltos bruscos (> 0.5 m entre ticks)
         if self.odom_recibida:
             salto = math.hypot(x - self.current_x, y - self.current_y)
@@ -116,7 +115,7 @@ class NavigationNode(Node):
     # ══════════════════════════════════════════════════════════════════════════
     # HELPERS DE MOVIMIENTO
     # ══════════════════════════════════════════════════════════════════════════
-    
+
     def _rotar_a(self, theta_objetivo_rad: float) -> bool:
         """
         Gira hasta alcanzar un ángulo absoluto en el marco mundo.
@@ -142,28 +141,37 @@ class NavigationNode(Node):
 
         return done
 
-    def _mover_adelante(self, distancia: float) -> str:
+    def _mover_adelante(self, target_xy: tuple) -> str:
         """
-        Avanza usando odometría real.
+        Avanza hacia target_xy usando proximidad de posición como criterio
+        de llegada.  Antes se medía distancia recorrida desde el
+        inicio del segmento, lo que fallaba cuando la odometría tenía drift
+        lateral: el robot declaraba 'COMPLETADO' pero estaba en la posición
+        equivocada, causando que el siguiente segmento apuntara hacia un
+        obstáculo.
         Devuelve: 'EN_RUTA' | 'COMPLETADO' | 'BLOQUEADO'
-
-        CAMBIO: reemplaza el heurístico de distancia al origen por el flag
-        self.odom_recibida para detectar si la odometría ya es válida.
         """
         if not self.odom_recibida:
             return 'EN_RUTA'
 
-        # Guardar posición de inicio del segmento una sola vez
+        tx, ty = target_xy
+
+        # ── Criterio de llegada: distancia al waypoint destino ────────────────
+        dist_restante = math.hypot(self.current_x - tx, self.current_y - ty)
+        if dist_restante < TOL_POSICION:
+            self.dist_recorrida_total += self.segment_dist
+            self.pose_inicial_flag = None
+            self.cmd_pub.publish(Twist())
+            return 'COMPLETADO'
+
+        # Log de inicio de segmento
         if self.pose_inicial_flag is None:
             self.pose_inicial_flag = (self.current_x, self.current_y)
             self.get_logger().info(
-                f"  Inicio segmento en ({self.current_x:.2f}, {self.current_y:.2f})")
+                f"  Inicio segmento en ({self.current_x:.2f}, {self.current_y:.2f}) "
+                f"→ ({tx:.2f}, {ty:.2f}), dist={dist_restante:.2f} m")
 
-        # Distancia real recorrida en este segmento
-        x0, y0 = self.pose_inicial_flag
-        recorrido = math.hypot(self.current_x - x0, self.current_y - y0)
-
-        # Verificar obstáculos al frente con LiDAR
+        # ── Verificar obstáculos al frente con LiDAR ──────────────────────────
         cono = obtener_distancias_rango(self.last_scan, -CONO_VISION, CONO_VISION)
         distancias_validas = [d for d in cono if 0 < d < float('inf')]
         dist_frente = min(distancias_validas) if distancias_validas else float('inf')
@@ -174,25 +182,20 @@ class NavigationNode(Node):
             self.cmd_pub.publish(Twist())
             return 'BLOQUEADO'
 
-        if recorrido >= distancia:
-            self.dist_recorrida_total += recorrido   
-            self.pose_inicial_flag = None
-            self.cmd_pub.publish(Twist())
-            return 'COMPLETADO'
-
+        # ── Avanzar con velocidad proporcional a la distancia restante ────────
+        # (frena suavemente al acercarse al waypoint)
+        vel = min(VEL_LINEAL, max(0.12, dist_restante * 1.2))
         cmd = Twist()
-        cmd.linear.x = VEL_LINEAL
+        cmd.linear.x = vel
         self.cmd_pub.publish(cmd)
         return 'EN_RUTA'
 
     # ══════════════════════════════════════════════════════════════════════════
     # PARSEO DE ESCENA
     # ══════════════════════════════════════════════════════════════════════════
-    
     def _parsear_escena(self, numero: int) -> dict | None:
         share_dir = get_package_share_directory('proyecto')
         ruta = os.path.join(share_dir, 'data', f'Escena-Problema{numero}.txt')
-    
         datos = {'obstaculos': []}
         try:
             with open(ruta, 'r', encoding='utf-8') as f:
@@ -325,11 +328,9 @@ class NavigationNode(Node):
                             actualizar(t, px, oy + t * dy)
 
         return best_pt
-    
     # ══════════════════════════════════════════════════════════════════════════
     # SALIDA A ARCHIVO
     # ══════════════════════════════════════════════════════════════════════════
-    
     def _guardar_camino(self, configs, escena, qf_est=None, q_act=None):
         ruta = os.path.expanduser(f'~/Camino-Escena{escena}.txt')
         try:
@@ -367,8 +368,7 @@ class NavigationNode(Node):
             scene       = scene,
             robot_radio = ROBOT_RADIO,
         )
-        self.dt_planificacion = dt_plan  
-
+        self.dt_planificacion = dt_plan 
         if waypoints_raw is None:
             self.get_logger().error(f"RRT no encontró solución en {dt_plan:.1f} s. Abortando.")
             return
@@ -408,11 +408,11 @@ class NavigationNode(Node):
         # 6. Iniciar ejecución
         self.pos_idx = 1
         self._preparar_siguiente_segmento()
-        if self.target_theta_abs is None:
+        if self.target_theta_abs is None and self.state != 'ROTANDO':
+            # _preparar puede haber disparado replanificación; si no, verificar
             self.get_logger().error("target_theta_abs no calculado. Abortando.")
             return
 
-        # NUEVO: registrar tiempo de inicio de ejecución para mejor toma de metricas
         self.t_inicio_ejecucion = time.perf_counter()
 
         self.state = 'ROTANDO'
@@ -423,11 +423,28 @@ class NavigationNode(Node):
         )
 
     def _preparar_siguiente_segmento(self):
-        if self.pos_idx < len(self.positions):
-            x1, y1 = self.positions[self.pos_idx - 1]
-            x2, y2 = self.positions[self.pos_idx]
-            self.target_theta_abs = math.atan2(y2 - y1, x2 - x1)
-            self.segment_dist     = math.hypot(x2 - x1, y2 - y1)
+        """
+        Calcula heading y distancia del segmento actual y guarda el waypoint
+        destino para la llegada por proximidad.
+        """
+        if self.pos_idx >= len(self.positions):
+            return
+
+        x1, y1 = self.positions[self.pos_idx - 1]
+        x2, y2 = self.positions[self.pos_idx]
+
+        drift = math.hypot(self.current_x - x1, self.current_y - y1)
+        if drift > DRIFT_MAX_REPLAN and self.odom_recibida:
+            self.get_logger().warn(
+                f"  Drift de {drift:.2f} m detectado en inicio de segmento "
+                f"(actual=({self.current_x:.2f},{self.current_y:.2f}), "
+                f"esperado=({x1:.2f},{y1:.2f})) – replanificando.")
+            self._replanificar()
+            return
+
+        self.target_theta_abs  = math.atan2(y2 - y1, x2 - x1)
+        self.segment_dist      = math.hypot(x2 - x1, y2 - y1)
+        self.segment_target_xy = (x2, y2)  
 
     # ══════════════════════════════════════════════════════════════════════════
     # BUCLE DE CONTROL PRINCIPAL
@@ -461,7 +478,7 @@ class NavigationNode(Node):
 
         # ── MOVIENDO ──────────────────────────────────────────────────────────
         elif self.state == 'MOVIENDO':
-            estado = self._mover_adelante(self.segment_dist)
+            estado = self._mover_adelante(self.segment_target_xy)
 
             if estado == 'COMPLETADO':
                 self.get_logger().info(
@@ -538,9 +555,6 @@ class NavigationNode(Node):
 
         self._preparar_siguiente_segmento()
         self.state = 'ROTANDO'
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # REPORTE FINAL Y RELOCALIZACIÓN
     # ══════════════════════════════════════════════════════════════════════════
 
     def _reportar_y_relocalizar(self):
@@ -586,7 +600,6 @@ class NavigationNode(Node):
         self.get_logger().info(sep)
         self._guardar_camino(self.path_configs, self.numero_escena, qf_est, q_act)
         self.cmd_pub.publish(Twist())   # frenar el robot
-        
     def _auto_start(self):
         self._inicio_timer.cancel()
         self.ejecutar_escena(self.numero_escena)
