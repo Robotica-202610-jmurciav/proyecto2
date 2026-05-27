@@ -22,7 +22,7 @@ VEL_ANGULAR   = 0.2    # rad/s
 TOL_ANGULAR   = 0.15   # rad ≈ 8.6°
 DIST_SEGURA   = 0.10   # m  – distancia mínima al obstáculo antes de abortar
 CONO_VISION   = 25     # °  – semángulo del cono de detección frontal
-NUMERO_ESCENA = 5      # número de escena a ejecutar (1-6)
+NUMERO_ESCENA = 6      # número de escena a ejecutar (1-6)
 
 TOL_POSICION   = 0.15  # m  – radio de captura del waypoint
 DRIFT_MAX_REPLAN = 0.25  # m
