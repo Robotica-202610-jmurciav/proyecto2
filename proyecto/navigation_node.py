@@ -95,7 +95,7 @@ class NavigationNode(Node):
             # Lectura de "reinicio de frame": ignorar silenciosamente
             return
         # Filtro de saltos bruscos (> 0.5 m entre ticks)
-        if self.odom_recibida:
+        if self.odom_recibida and self.state not in ('ESPERANDO_COMANDO',):
             salto = math.hypot(x - self.current_x, y - self.current_y)
             if salto > 0.5:
                 self.get_logger().warn(
