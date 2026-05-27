@@ -412,12 +412,15 @@ class NavigationNode(Node):
 
         # 6. Iniciar ejecución
         self.pos_idx = 1
-        self._preparar_siguiente_segmento()
-        if self.target_theta_abs is None and self.state != 'ROTANDO':
-            # _preparar puede haber disparado replanificación; si no, verificar
-            self.get_logger().error("target_theta_abs no calculado. Abortando.")
-            return
-
+        x1, y1 = self.positions[0]
+        x2, y2 = self.positions[1]
+        self.target_theta_abs  = math.atan2(y2 - y1, x2 - x1)
+        self.segment_dist      = math.hypot(x2 - x1, y2 - y1)
+        self.segment_target_xy = (x2, y2)
+        self.get_logger().info(
+            f"  Primer segmento: ({x1:.3f},{y1:.3f}) → ({x2:.3f},{y2:.3f}), "
+            f"θ={math.degrees(self.target_theta_abs):.1f}°")
+        
         self.t_inicio_ejecucion = time.perf_counter()
 
         self.state = 'ROTANDO'
