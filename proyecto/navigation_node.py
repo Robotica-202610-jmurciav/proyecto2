@@ -439,17 +439,17 @@ class NavigationNode(Node):
         x2, y2 = self.positions[self.pos_idx]
 
         drift = math.hypot(self.current_x - x1, self.current_y - y1)
-        if drift > DRIFT_MAX_REPLAN and self.odom_recibida:
+        pos_es_origen_sin_inicializar = (
+            math.hypot(self.current_x, self.current_y) < 0.05 and
+            math.hypot(x1, y1) > 0.30
+        )
+        if drift > DRIFT_MAX_REPLAN and self.odom_recibida and not pos_es_origen_sin_inicializar:
             self.get_logger().warn(
                 f"  Drift de {drift:.2f} m detectado en inicio de segmento "
                 f"(actual=({self.current_x:.2f},{self.current_y:.2f}), "
                 f"esperado=({x1:.2f},{y1:.2f})) – replanificando.")
             self._replanificar()
             return
-
-        self.target_theta_abs  = math.atan2(y2 - y1, x2 - x1)
-        self.segment_dist      = math.hypot(x2 - x1, y2 - y1)
-        self.segment_target_xy = (x2, y2)  
 
     # ══════════════════════════════════════════════════════════════════════════
     # BUCLE DE CONTROL PRINCIPAL
@@ -534,12 +534,23 @@ class NavigationNode(Node):
             f"  Replanificando desde ({pos_actual[0]:.2f}, {pos_actual[1]:.2f}) "
             f"→ qf=({qf[0]:.2f}, {qf[1]:.2f})")
 
-        waypoints_raw, dt_plan = rrt(pos_actual, (qf[0], qf[1]),
-                                     scene, ROBOT_RADIO)
-        if waypoints_raw is None:
-            self.get_logger().error("Replanificación RRT fallida. Abortando.")
-            self.state = 'DONE'
-            return
+        try:
+            waypoints_raw, dt_plan = rrt(pos_actual, (qf[0], qf[1]),
+                                        scene, ROBOT_RADIO)
+        except ValueError as e:
+            # Posición actual inválida (dentro de obstáculo): usar q0 de la escena
+            self.get_logger().error(
+                f"RRT rechazó pos_actual={pos_actual}: {e}\n"
+                f"  → Reintentando desde q0 de escena ({scene['q0'][0]:.2f}, {scene['q0'][1]:.2f}).")
+            q0_scene = scene['q0']
+            pos_actual = (q0_scene[0], q0_scene[1])
+            try:
+                waypoints_raw, dt_plan = rrt(pos_actual, (qf[0], qf[1]),
+                                            scene, ROBOT_RADIO)
+            except ValueError as e2:
+                self.get_logger().error(f"Replanificación fallida incluso desde q0: {e2}. Abortando.")
+                self.state = 'DONE'
+                return
 
         waypoints_suave = suavizar(waypoints_raw, scene, ROBOT_RADIO)
         new_pos = [pos_actual] + list(waypoints_suave[1:-1]) + [(qf[0], qf[1])]
