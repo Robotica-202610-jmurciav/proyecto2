@@ -513,7 +513,16 @@ class NavigationNode(Node):
 
     def _avanzar_estado_post_movimiento(self):
         if self.pos_idx < len(self.positions):
-            self._preparar_siguiente_segmento()
+            x1, y1 = self.positions[self.pos_idx - 1]
+            x2, y2 = self.positions[self.pos_idx]
+            self.target_theta_abs  = math.atan2(y2 - y1, x2 - x1)
+            self.segment_dist      = math.hypot(x2 - x1, y2 - y1)
+            self.segment_target_xy = (x2, y2)
+            self.get_logger().info(
+                f"  Siguiente segmento [{self.pos_idx}]: "
+                f"({x1:.3f},{y1:.3f}) → ({x2:.3f},{y2:.3f}), "
+                f"θ={math.degrees(self.target_theta_abs):.1f}°, "
+                f"dist={self.segment_dist:.2f} m")
             self.state = 'ROTANDO'
         else:
             self.state = 'ROTACION_FINAL'
